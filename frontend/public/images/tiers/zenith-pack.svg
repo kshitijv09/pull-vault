@@ -1,0 +1,14 @@
+<svg width="640" height="320" viewBox="0 0 640 320" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="640" height="320" rx="20" fill="#1A0F0A"/>
+  <rect x="16" y="16" width="608" height="288" rx="16" fill="url(#g1)" stroke="#7C2D12"/>
+  <circle cx="130" cy="84" r="58" fill="#FB923C" fill-opacity="0.28"/>
+  <circle cx="512" cy="240" r="76" fill="#F97316" fill-opacity="0.18"/>
+  <text x="42" y="238" fill="#FFEDD5" font-size="54" font-family="Inter, Arial, sans-serif" font-weight="700">ZENITH</text>
+  <text x="42" y="272" fill="#FDBA74" font-size="22" font-family="Inter, Arial, sans-serif">Tier Pack</text>
+  <defs>
+    <linearGradient id="g1" x1="16" y1="16" x2="624" y2="304" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2C120A"/>
+      <stop offset="1" stop-color="#7C2D12"/>
+    </linearGradient>
+  </defs>
+</svg>

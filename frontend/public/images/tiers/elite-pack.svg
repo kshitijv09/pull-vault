@@ -1,0 +1,14 @@
+<svg width="640" height="320" viewBox="0 0 640 320" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="640" height="320" rx="20" fill="#0F172A"/>
+  <rect x="16" y="16" width="608" height="288" rx="16" fill="url(#g1)" stroke="#334155"/>
+  <circle cx="120" cy="90" r="52" fill="#38BDF8" fill-opacity="0.25"/>
+  <circle cx="520" cy="240" r="70" fill="#22D3EE" fill-opacity="0.18"/>
+  <text x="42" y="238" fill="#E2E8F0" font-size="54" font-family="Inter, Arial, sans-serif" font-weight="700">ELITE</text>
+  <text x="42" y="272" fill="#94A3B8" font-size="22" font-family="Inter, Arial, sans-serif">Tier Pack</text>
+  <defs>
+    <linearGradient id="g1" x1="16" y1="16" x2="624" y2="304" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0B1220"/>
+      <stop offset="1" stop-color="#102A43"/>
+    </linearGradient>
+  </defs>
+</svg>

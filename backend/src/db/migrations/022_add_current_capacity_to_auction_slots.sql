@@ -1,0 +1,1 @@
+ALTER TABLE auction_slots ADD COLUMN IF NOT EXISTS current_capacity INTEGER NOT NULL DEFAULT 0;

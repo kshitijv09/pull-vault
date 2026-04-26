@@ -1,0 +1,1 @@
+-- Intentionally empty: keep non-user tables unseeded.

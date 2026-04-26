@@ -1,0 +1,14 @@
+<svg width="640" height="320" viewBox="0 0 640 320" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="640" height="320" rx="20" fill="#111827"/>
+  <rect x="16" y="16" width="608" height="288" rx="16" fill="url(#g1)" stroke="#374151"/>
+  <circle cx="520" cy="86" r="58" fill="#A78BFA" fill-opacity="0.25"/>
+  <circle cx="150" cy="246" r="74" fill="#C084FC" fill-opacity="0.18"/>
+  <text x="42" y="238" fill="#F3E8FF" font-size="54" font-family="Inter, Arial, sans-serif" font-weight="700">PINNACLE</text>
+  <text x="42" y="272" fill="#C4B5FD" font-size="22" font-family="Inter, Arial, sans-serif">Tier Pack</text>
+  <defs>
+    <linearGradient id="g1" x1="16" y1="16" x2="624" y2="304" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1F1B3A"/>
+      <stop offset="1" stop-color="#312E81"/>
+    </linearGradient>
+  </defs>
+</svg>

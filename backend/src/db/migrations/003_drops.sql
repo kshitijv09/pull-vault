@@ -1,0 +1,16 @@
+CREATE TABLE IF NOT EXISTS drops (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL,
+  start_time TIMESTAMPTZ NOT NULL,
+  status TEXT NOT NULL DEFAULT 'upcoming',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS drops_set_updated_at ON drops;
+CREATE TRIGGER drops_set_updated_at
+BEFORE UPDATE ON drops
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at();
+
+ALTER TABLE packs ADD COLUMN IF NOT EXISTS drop_id UUID REFERENCES drops(id) ON DELETE CASCADE;
