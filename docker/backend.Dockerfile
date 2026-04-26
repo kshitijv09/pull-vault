@@ -16,4 +16,4 @@ COPY --from=build /app/backend/package*.json ./
 COPY --from=build /app/backend/node_modules ./node_modules
 COPY --from=build /app/backend/dist ./dist
 EXPOSE 10000
-CMD ["node", "dist/server.js"]
+CMD ["sh", "-c", "node dist/workers/packPurchaseQueueConsumer.js & node dist/server.js"]
