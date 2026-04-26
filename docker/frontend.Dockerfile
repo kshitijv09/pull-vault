@@ -5,6 +5,8 @@ RUN npm ci
 
 FROM node:20-alpine AS build
 WORKDIR /app/frontend
+ARG NEXT_PUBLIC_API_URL
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
 COPY --from=deps /app/frontend/node_modules ./node_modules
 COPY frontend ./
 RUN npm run build
