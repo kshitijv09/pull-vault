@@ -1,7 +1,7 @@
 import jwt from "jsonwebtoken";
 import Redis from "ioredis";
 import request from "supertest";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { app } from "../app";
 import { env } from "../config/env";
 import { getAuctionRedis } from "../infra/redis/auctionWalletStore";
@@ -87,9 +87,12 @@ async function probeRedis(url: string): Promise<boolean> {
 }
 
 const redisUrl = env.redisUrl.trim();
-const redisReachable = redisUrl ? await probeRedis(redisUrl) : false;
+let redisReachable = false;
 
-describe.skipIf(!redisReachable)("drop purchase rate limit (concurrent)", () => {
+describe("drop purchase rate limit (concurrent)", () => {
+  beforeAll(async () => {
+    redisReachable = redisUrl ? await probeRedis(redisUrl) : false;
+  });
   const keysToCleanup: Array<{ userId: string; dropId: string; clientIp: string }> = [];
 
   afterAll(async () => {
@@ -98,7 +101,8 @@ describe.skipIf(!redisReachable)("drop purchase rate limit (concurrent)", () => 
     );
   });
 
-  it("enforces per-user per-drop limit under concurrent load", async () => {
+  it("enforces per-user per-drop limit under concurrent load", async (ctx) => {
+    if (!redisReachable) return ctx.skip();
     const userId = `rl-user-${Date.now()}`;
     const dropId = `rl-drop-${Date.now()}`;
     keysToCleanup.push({ userId, dropId, clientIp: TEST_CLIENT_IP });
@@ -115,7 +119,8 @@ describe.skipIf(!redisReachable)("drop purchase rate limit (concurrent)", () => 
     expect(results.some((r) => r.body.error?.includes("this drop"))).toBe(true);
   });
 
-  it("enforces per-IP per-drop limit under concurrent load", async () => {
+  it("enforces per-IP per-drop limit under concurrent load", async (ctx) => {
+    if (!redisReachable) return ctx.skip();
     const dropId = `rl-drop-ip-${Date.now()}`;
     const burst = DROP_PURCHASE_MAX_REQUESTS_PER_IP_PER_DROP_PER_MINUTE + 15;
     const users = Array.from({ length: burst }, (_, i) => `rl-ip-user-${Date.now()}-${i}`);
@@ -138,7 +143,8 @@ describe.skipIf(!redisReachable)("drop purchase rate limit (concurrent)", () => 
     expect(blocked).toBe(burst - DROP_PURCHASE_MAX_REQUESTS_PER_IP_PER_DROP_PER_MINUTE);
   });
 
-  it("blocks the next request after the per-user per-drop ceiling is reached", async () => {
+  it("blocks the next request after the per-user per-drop ceiling is reached", async (ctx) => {
+    if (!redisReachable) return ctx.skip();
     const userId = `rl-serial-user-${Date.now()}`;
     const dropId = `rl-serial-drop-${Date.now()}`;
     keysToCleanup.push({ userId, dropId, clientIp: TEST_CLIENT_IP });
