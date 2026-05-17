@@ -217,6 +217,50 @@ export class AuctionController {
     }
   };
 
+  evaluateAuctionFraudReview = async (req: Request, res: Response): Promise<void> => {
+    try {
+      const auctionId = typeof req.params.auctionId === "string" ? req.params.auctionId.trim() : "";
+      if (!UUID.test(auctionId)) {
+        res.status(400).json({ error: "Invalid auction id format." });
+        return;
+      }
+      const data = await this.service.evaluateAuctionFraudReview(auctionId);
+      res.status(200).json({ data });
+    } catch (error: any) {
+      this.handleError(res, error);
+    }
+  };
+
+  placeSealedBid = async (req: Request, res: Response): Promise<void> => {
+    try {
+      const authReq = req as AuthRequest;
+      const auctionId = req.params.auctionId;
+      const bidderId = authReq.user?.id?.trim() ?? "";
+      const biddingPriceUsd =
+        typeof req.body?.biddingPriceUsd === "string" || typeof req.body?.biddingPriceUsd === "number"
+          ? String(req.body.biddingPriceUsd)
+          : "";
+
+      if (!UUID.test(auctionId)) {
+        res.status(400).json({ error: "Invalid auction id format." });
+        return;
+      }
+      if (!UUID.test(bidderId)) {
+        res.status(401).json({ error: "Unauthorized." });
+        return;
+      }
+      if (!biddingPriceUsd.trim()) {
+        res.status(400).json({ error: "Body biddingPriceUsd is required." });
+        return;
+      }
+
+      const data = await this.service.placeSealedBid(auctionId, bidderId, biddingPriceUsd);
+      res.status(200).json({ data });
+    } catch (error: any) {
+      this.handleError(res, error);
+    }
+  };
+
   addSlotListing = async (req: Request, res: Response): Promise<void> => {
     try {
       const authReq = req as AuthRequest;

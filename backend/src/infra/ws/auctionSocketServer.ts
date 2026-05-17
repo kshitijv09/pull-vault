@@ -9,7 +9,8 @@ import {
   auctionViewerUsersKey,
   getCachedHighestBidState,
   getAuctionWalletBalanceFromCache,
-  getAuctionRedis
+  getAuctionRedis,
+  isSealedPhaseActiveInRedis
 } from "../redis/auctionWalletStore";
 import { AuctionRepository } from "../../modules/auction/auction.repository";
 import type { AuctionBidBroadcastPayload } from "../../modules/auction/auction.types";
@@ -188,11 +189,14 @@ export class AuctionSocketServer {
     walletBalanceUsd?: string;
     bidHistory: AuctionBidBroadcastPayload["bidHistory"];
     updatedAt: string;
+    sealedPhaseActive: boolean;
   } | null> {
     const listing = await this.repository.getAuctionListingById(auctionListingId);
     if (!listing) {
       return null;
     }
+    const sealedPhaseActive =
+      (await isSealedPhaseActiveInRedis(auctionListingId)) || listing.sealedPhaseActive;
     const cachedHighest = await getCachedHighestBidState(auctionListingId);
     const currentBidUsd = cachedHighest?.bidUsd ?? listing.startBidUsd;
     const incrementUsd =
@@ -216,7 +220,8 @@ export class AuctionSocketServer {
       viewerCount,
       walletBalanceUsd: walletBalanceUsd ?? undefined,
       bidHistory,
-      updatedAt: new Date().toISOString()
+      updatedAt: new Date().toISOString(),
+      sealedPhaseActive
     };
   }
 

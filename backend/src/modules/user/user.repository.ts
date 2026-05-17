@@ -223,6 +223,7 @@ export class UserRepository {
           uc.id AS "userCardId",
           c.id AS "catalogCardId",
           up.pack_id AS "packId",
+          up.id AS "userPackId",
           c.card_id AS "cardId",
           c.name,
           c.card_set AS "cardSet",

@@ -1,3 +1,8 @@
+import type {
+  PackFairnessPoolSnapshotResponse,
+  PackFairnessRevealResponse
+} from "./fairness/types";
+
 const defaultBase = "http://localhost:4000/api";
 
 export function getApiBaseUrl(): string {
@@ -58,7 +63,10 @@ export type UserOwnedCardFacets = {
 export type UserOwnedCard = {
   userCardId: string;
   catalogCardId: string;
+  /** `pack_inventory.id` the user_card was assigned to (legacy `pack_id` reference). */
   packId: string | null;
+  /** `user_packs.id` — the owning pack purchase row. Used for fairness verification deep-links. */
+  userPackId: string | null;
   cardId: string;
   name: string;
   cardSet: string;
@@ -153,6 +161,28 @@ export type AuctionListing = {
   cardSet: string | null;
   cardRarity: string | null;
   cardImageUrl: string | null;
+  needsFraudReview?: boolean | null;
+};
+
+/** `POST /auctions/:auctionId/fraud-review` — evaluates heuristics and updates listing.needsFraudReview. */
+export type AuctionFraudReviewResponse = {
+  auctionListingId: string;
+  needsFraudReview: boolean;
+  h1RepeatPairSuspicion: boolean;
+  h2UncontestedLowPriceSuspicion: boolean;
+  h3HeavyNonWinnerOpenBidsSuspicion: boolean;
+  h6SingleAccountBidSpamSuspicion: boolean;
+  heuristics: {
+    pairTradeCountInWindow: number;
+    repeatPairWindowDays: number;
+    distinctOpenBidders: number | null;
+    priceToMarketRatio: string | null;
+    h3MaxNonWinnerOpenBidCount: number;
+    h3MinOpenBidsNonWinnerThreshold: number;
+    h6MaxBidsInRollingWindow: number;
+    h6BidSpamWindowSeconds: number;
+    h6IncrementViolationCount: number;
+  };
 };
 
 export type AuctionBidHistoryEntry = {
@@ -169,6 +199,8 @@ export type AuctionBidInitResponse = {
   minBidUsd: string;
   walletBalanceUsd: string;
   walletSource: "cache" | "db";
+  sealedPhaseActive: boolean;
+  hasSubmittedSealedBid: boolean;
 };
 
 export type PlaceAuctionBidResponse = {
@@ -180,6 +212,15 @@ export type PlaceAuctionBidResponse = {
   walletBalanceUsd: string;
   incrementUsd: string;
   antiSnipingApplied: boolean;
+  sealedPhaseStarted: boolean;
+};
+
+export type PlaceSealedAuctionBidResponse = {
+  auctionListingId: string;
+  endTime: string;
+  walletBalanceUsd: string;
+  sealedPhaseActive: true;
+  hasSubmittedSealedBid: true;
 };
 
 export type StartAuctionResponse = {
@@ -200,6 +241,7 @@ export type AuctionSnapshotSocketMessage = {
   walletBalanceUsd?: string;
   bidHistory: AuctionBidHistoryEntry[];
   updatedAt: string;
+  sealedPhaseActive?: boolean;
 };
 
 export type AuctionBidUpdatedSocketMessage = {
@@ -214,6 +256,15 @@ export type AuctionBidUpdatedSocketMessage = {
   antiSnipingApplied: boolean;
   bidHistory: AuctionBidHistoryEntry[];
   updatedAt: string;
+  sealedPhaseActive?: boolean;
+};
+
+export type AuctionSealedPhaseStartedSocketMessage = {
+  type: "auction_sealed_phase_started";
+  auctionListingId: string;
+  endTime: string;
+  reason: "anti_snipe_threshold";
+  updatedAt: string;
 };
 
 export type AuctionFinalizedSocketMessage = {
@@ -222,6 +273,7 @@ export type AuctionFinalizedSocketMessage = {
   status: "sold" | "unsold";
   winnerUserId: string | null;
   winningBidUsd: string | null;
+  winningBidSource?: "open" | "sealed" | null;
   cardName?: string | null;
   winnerName?: string | null;
   updatedAt: string;
@@ -237,6 +289,7 @@ export type AuctionViewerCountSocketMessage = {
 export type AuctionSocketMessage =
   | AuctionSnapshotSocketMessage
   | AuctionBidUpdatedSocketMessage
+  | AuctionSealedPhaseStartedSocketMessage
   | AuctionFinalizedSocketMessage
   | AuctionViewerCountSocketMessage;
 
@@ -508,6 +561,252 @@ export function getUserProfile(userId: string): Promise<UserProfile> {
   return apiGetJson<UserProfile>(`/users/${userId}`);
 }
 
+export function getPackFairnessReveal(userPackId: string): Promise<PackFairnessRevealResponse> {
+  return apiGetJson<PackFairnessRevealResponse>(`/user-packs/${userPackId}/fairness-reveal`);
+}
+
+export function getDropFairnessPoolSnapshot(
+  dropId: string
+): Promise<PackFairnessPoolSnapshotResponse> {
+  return apiGetJson<PackFairnessPoolSnapshotResponse>(`/drops/${dropId}/fairness-pool-snapshot`);
+}
+
+export type PackFairnessCommitResponse = {
+  /** UUID; show in UI as "Fairness session ID". Passed to /pack-queue/purchases as `nonce`. */
+  nonce: string;
+  /** `SHA-256(server_secret)` lowercase hex (64 chars). */
+  server_commitment: string;
+  /** Final `client_seed` echoed back (either the user's trimmed input or a server-generated hex string). */
+  client_seed: string;
+  client_seed_source: "user" | "server";
+};
+
+/**
+ * Phase 1 of the provably-fair scheme. Optional `clientSeed` (max 512 chars).
+ * Server generates one if omitted / blank. Caller MUST persist the returned
+ * `nonce` and pass it as `nonce` on the subsequent `/pack-queue/purchases`
+ * call to bind the eventual draw to this commitment.
+ */
+export function commitPackFairness(
+  dropId: string,
+  clientSeed?: string
+): Promise<PackFairnessCommitResponse> {
+  const body: Record<string, unknown> = {};
+  if (typeof clientSeed === "string" && clientSeed.trim().length > 0) {
+    body.client_seed = clientSeed.trim();
+  }
+  return apiPostJson<PackFairnessCommitResponse>(`/drops/${dropId}/fairness-commit`, body);
+}
+
+/**
+ * Fire-and-forget verifier beacon. Called by the browser-only verifier in
+ * `app/(marketing)/verify/[userPackId]/page.tsx` after every replay so the
+ * B5 fairness-audit panel can show "how many users used the verification."
+ * Anonymous-OK (the endpoint is gated by `optionalAuthMiddleware`).
+ *
+ * Returns immediately and silently swallows any errors; an outage in the
+ * audit pipeline must never block a verification result from being shown
+ * to the user.
+ */
+export function reportPackFairnessVerifyEvent(
+  userPackId: string,
+  payload: { result: "pass" | "fail"; failingCheck?: string | null }
+): Promise<void> {
+  const url = `${getApiBaseUrl()}/user-packs/${userPackId}/fairness-verify-event`;
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (typeof window !== "undefined") {
+    try {
+      const stored = window.localStorage.getItem("pullvault.auth");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed?.token) headers["Authorization"] = `Bearer ${parsed.token}`;
+      }
+    } catch {}
+  }
+  const body = JSON.stringify({
+    result: payload.result,
+    failingCheck: payload.failingCheck ?? null
+  });
+  return fetch(url, { method: "POST", headers, body, keepalive: true })
+    .then(() => undefined)
+    .catch(() => undefined);
+}
+
+/* ── Platform Health Dashboard (B5) ──────────────────────────────────── */
+
+export type PlatformHealthRangePreset = EarningsRangePreset;
+
+export type PlatformHealthWindow = {
+  fromIso: string | null;
+  toIso: string | null;
+  rangePreset: PlatformHealthRangePreset | null;
+};
+
+export type RateLimitBlockScope = "user_global" | "user_drop" | "ip_global" | "ip_drop";
+
+export type FraudPanel = {
+  rateLimit: {
+    totalBlocks: number;
+    totalAcceptedPurchases: number;
+    blockShareOfAttempts: string | null;
+    byScope: Array<{ scope: RateLimitBlockScope; count: number }>;
+  };
+  topBlockedIps: Array<{ clientIp: string; blocks: number; shareOfTotal: string }>;
+  auctionFraud: {
+    settledCount: number;
+    needsFraudReviewCount: number;
+    flagRate: string | null;
+    sealedPhaseRate: string | null;
+  };
+};
+
+export type TierMarginRow = {
+  tierName: string;
+  packsOpened: number;
+  retailRevenueUsd: string;
+  realisedValueUsd: string;
+  actualMargin: string | null;
+  targetMargin: string;
+  marginGapPp: string | null;
+  winRate: string | null;
+};
+
+export type RevenueProjection = {
+  totalRevenueUsd: string;
+  projectedNext24hUsd: string;
+  projectedNext7dUsd: string;
+};
+
+export type PoolDriftRow = {
+  dropId: string;
+  dropName: string;
+  poolSnapshotCreatedAt: string;
+  medianDriftPct: string;
+  maxDriftPct: string;
+  cardsCompared: number;
+};
+
+export type EconomicsPanel = {
+  tiers: TierMarginRow[];
+  revenue: {
+    packPurchase: RevenueProjection;
+    marketplacePurchase: RevenueProjection;
+    auctionCompletion: RevenueProjection;
+    total: RevenueProjection;
+  };
+  pools: PoolDriftRow[];
+};
+
+export type ChiSquaredBucket = {
+  rarity: string;
+  observed: number;
+  expected: number;
+  standardisedResidual: string;
+  dropped: boolean;
+};
+
+export type ChiSquaredResult = {
+  tierName: string;
+  totalCardsObserved: number;
+  degreesOfFreedom: number;
+  chiSquared: string;
+  pValue: string | null;
+  alpha: string;
+  decision: "accept" | "reject" | "insufficient_data";
+  buckets: ChiSquaredBucket[];
+};
+
+export type FairnessPanel = {
+  usage: {
+    totalConsumedCommits: number;
+    totalReveals: number;
+    distinctUserPacksVerified: number;
+    totalVerifyEvents: number;
+    failedVerifyEvents: number;
+  };
+  chiSquared: {
+    perTier: ChiSquaredResult[];
+    overallDecision: "accept" | "reject" | "insufficient_data";
+    bonferroniAlpha: string;
+  };
+};
+
+export type UserHealthPanel = {
+  dau: number;
+  wau: number;
+  mau: number;
+  dauOverMau: string | null;
+  dropParticipationRate: string | null;
+  auctionParticipationRate: string | null;
+  packToListConversion24h: string | null;
+  retention: {
+    cohortStart: string | null;
+    d1: string | null;
+    d7: string | null;
+    d30: string | null;
+  };
+  badge: "green" | "yellow" | "red";
+  badgeBreakdown: Array<{
+    signal: string;
+    status: "green" | "yellow" | "red";
+    value: string | null;
+  }>;
+};
+
+export type HealthAlertKey =
+  | "rate_limit_pressure"
+  | "single_ip_spike"
+  | "auction_fraud_flag_spike"
+  | "tier_margin_breach"
+  | "tier_win_rate_breach"
+  | "revenue_drop"
+  | "pool_price_drift"
+  | "rarity_distribution_breach"
+  | "verifier_failures"
+  | "pool_snapshot_stale";
+
+export type HealthAlertRow = {
+  id: string;
+  alertKey: HealthAlertKey;
+  severity: "info" | "warning" | "critical";
+  firedAt: string;
+  resolvedAt: string | null;
+  context: Record<string, unknown>;
+};
+
+export type PlatformHealthSummaryResponse = {
+  window: PlatformHealthWindow;
+  fraud: FraudPanel;
+  economics: EconomicsPanel;
+  fairness: FairnessPanel;
+  users: UserHealthPanel;
+  openAlerts: HealthAlertRow[];
+  recentAlerts: HealthAlertRow[];
+};
+
+export function getPlatformHealthSummary(query: {
+  range?: PlatformHealthRangePreset;
+  from?: string;
+  to?: string;
+} = {}): Promise<PlatformHealthSummaryResponse> {
+  return apiGetJson<PlatformHealthSummaryResponse>("/analytics/health/summary", {
+    range: query.range,
+    from: query.from,
+    to: query.to
+  });
+}
+
+export function simulateMarginDrop(payload: {
+  tierName: string;
+  packs: number;
+  marginGapPp: number;
+}): Promise<{ inserted: number; alertsTriggered: number }> {
+  return apiPostJson<{ inserted: number; alertsTriggered: number }>(
+    "/analytics/health/economics/simulate-margin-drop",
+    payload
+  );
+}
+
 export function getPublicUserProfiles(userIds: string[]): Promise<PublicUserProfile[]> {
   const ids = Array.from(new Set(userIds.map((id) => id.trim()).filter(Boolean)));
   return apiGetJson<PublicUserProfile[]>("/users/public/profiles", {
@@ -569,6 +868,101 @@ export function getEarningsEvents(query: EarningsEventsQuery = {}): Promise<Earn
   });
 }
 
+/** Dashboard presets match earnings (`range`). */
+export type AuctionAnalyticsRangePreset = EarningsRangePreset;
+export type AuctionAnalyticsGroupBy = "day" | "week" | "month";
+
+export type AuctionAnalyticsSummaryResponse = {
+  window: EarningsWindow;
+  filters: {
+    rangePreset: AuctionAnalyticsRangePreset | null;
+    snipeWindowSeconds: number;
+  };
+  settledAuctions: {
+    settledListingTotalCount: number;
+    soldCount: number;
+    unsoldCount: number;
+    listingsWithOpenBidActivityCount: number;
+    participationRateListingsWithOpenBids: string | null;
+    avgDistinctOpenBiddersAmongListingsWithBids: string | null;
+    avgOpenBidRowsPerListingWithBids: string | null;
+  };
+  pricingVsMarket: {
+    soldListingsWithPositiveMarketCount: number;
+    avgFinalBidToMarketRatio: string | null;
+    medianFinalBidToMarketRatio: string | null;
+  };
+  sniping: {
+    soldWithOpenBidHistoryCount: number;
+    soldWhereLastOpenBidInSnipeWindowCount: number;
+    openPhaseLastBidSnipeRate: string | null;
+  };
+  flags: {
+    needsFraudReviewCount: number;
+    fraudReviewFlagRate: string | null;
+  };
+  sealedPhase: {
+    listingsEnteredSealedPhaseCount: number;
+    sealedPhaseRateAmongSettled: string | null;
+  };
+};
+
+export type AuctionAnalyticsTimeseriesPoint = {
+  bucketStart: string;
+  settledListingCount: number;
+  soldCount: number;
+  unsoldCount: number;
+  listingsWithOpenBidActivityCount: number;
+  needsFraudReviewCount: number;
+};
+
+export type AuctionAnalyticsTimeseriesResponse = {
+  window: EarningsWindow;
+  filters: {
+    rangePreset: AuctionAnalyticsRangePreset | null;
+    groupBy: AuctionAnalyticsGroupBy;
+  };
+  points: AuctionAnalyticsTimeseriesPoint[];
+};
+
+type AuctionAnalyticsSummaryQuery = {
+  range?: AuctionAnalyticsRangePreset;
+  from?: string;
+  to?: string;
+  snipeWindowSeconds?: number;
+};
+
+type AuctionAnalyticsTimeseriesQuery = {
+  range?: AuctionAnalyticsRangePreset;
+  from?: string;
+  to?: string;
+  groupBy?: AuctionAnalyticsGroupBy;
+  order?: EarningsSortOrder;
+};
+
+export function getAuctionAnalyticsSummary(
+  query: AuctionAnalyticsSummaryQuery = {}
+): Promise<AuctionAnalyticsSummaryResponse> {
+  return apiGetJson<AuctionAnalyticsSummaryResponse>("/analytics/auctions/summary", {
+    range: query.range,
+    from: query.from,
+    to: query.to,
+    snipeWindowSeconds: query.snipeWindowSeconds != null ? String(query.snipeWindowSeconds) : undefined
+  });
+}
+
+export function getAuctionAnalyticsTimeseries(
+  query: AuctionAnalyticsTimeseriesQuery = {}
+): Promise<AuctionAnalyticsTimeseriesResponse> {
+  return apiGetJson<AuctionAnalyticsTimeseriesResponse>("/analytics/auctions/timeseries", {
+    range: query.range,
+    from: query.from,
+    to: query.to,
+    groupBy: query.groupBy,
+    order: query.order
+  });
+}
+
 export function getAuctionSlots(query?: { slotStatus?: AuctionSlotStatus }): Promise<AuctionSlot[]> {
   return apiGetJson<AuctionSlot[]>("/auctions/slots", {
     slotStatus: query?.slotStatus
@@ -608,4 +1002,15 @@ export function placeAuctionBid(
   payload: { biddingPriceUsd: string }
 ): Promise<PlaceAuctionBidResponse> {
   return apiPostJson<PlaceAuctionBidResponse>(`/auctions/${auctionId}/bids`, payload);
+}
+
+export function placeAuctionSealedBid(
+  auctionId: string,
+  payload: { biddingPriceUsd: string }
+): Promise<PlaceSealedAuctionBidResponse> {
+  return apiPostJson<PlaceSealedAuctionBidResponse>(`/auctions/${auctionId}/bids/sealed`, payload);
+}
+
+export function evaluateAuctionFraudReview(auctionId: string): Promise<AuctionFraudReviewResponse> {
+  return apiPostJson<AuctionFraudReviewResponse>(`/auctions/${auctionId}/fraud-review`, {});
 }

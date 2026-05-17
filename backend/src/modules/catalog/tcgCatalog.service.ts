@@ -137,7 +137,18 @@ export class TcgCatalogService {
       pending.push(row);
     }
 
-    const insertedRows = await this.repository.insertCatalogCards(pending);
+    const existingIds = await this.repository.findExistingExternalCardIds(
+      pending.map((row) => row.externalCardId)
+    );
+    const toInsert = pending.filter((row) => {
+      if (existingIds.has(row.externalCardId)) {
+        skipped.push({ externalCardId: row.externalCardId, reason: "already_exists" });
+        return false;
+      }
+      return true;
+    });
+
+    const insertedRows = await this.repository.insertCatalogCards(toInsert);
 
     const created: CreatedCatalogCardRow[] = insertedRows.map((r) => ({
       id: r.id,

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import {
   ApiRequestError,
   getEarningsEvents,
@@ -127,9 +128,17 @@ export default function AnalyticsPage() {
 
   return (
     <div className="mx-auto max-w-7xl px-4 pb-16 pt-8 md:pt-10">
-      <header className="mb-6">
-        <h1 className="text-2xl font-bold tracking-tight text-white md:text-3xl">Earnings Analytics</h1>
-        <p className="mt-1 text-sm text-slate-400">Revenue dashboard across marketplace, auctions, and pack sales.</p>
+      <header className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight text-white md:text-3xl">Earnings Analytics</h1>
+          <p className="mt-1 text-sm text-slate-400">Revenue dashboard across marketplace, auctions, and pack sales.</p>
+        </div>
+        <Link
+          href="/analytics/health"
+          className="rounded-lg border border-white/15 bg-white/5 px-3 py-2 text-sm text-slate-200 hover:bg-white/10"
+        >
+          Platform Health Dashboard →
+        </Link>
       </header>
 
       <section className="rounded-2xl border border-white/10 bg-surface-raised/60 p-4">

@@ -1,6 +1,8 @@
 "use client";
 
 import { useState, useEffect, useMemo } from "react";
+import Link from "next/link";
+import { ShieldCheck } from "lucide-react";
 
 interface CardInfo {
   cardId: string;
@@ -14,10 +16,12 @@ interface CardInfo {
 interface PackOpenerProps {
   cards: CardInfo[];
   tierId: string;
+  /** `user_packs.id` for the purchase being opened; enables a deep-link to `/verify/:userPackId`. */
+  userPackId?: string;
   onClose: () => void;
 }
 
-export default function PackOpener({ cards, tierId, onClose }: PackOpenerProps) {
+export default function PackOpener({ cards, tierId, userPackId, onClose }: PackOpenerProps) {
   const [stage, setStage] = useState<"holding" | "opening" | "revealing" | "summary">("holding");
   const [currentCardIndex, setCurrentCardIndex] = useState(0);
   const [animatingCard, setAnimatingCard] = useState(false);
@@ -217,8 +221,16 @@ export default function PackOpener({ cards, tierId, onClose }: PackOpenerProps) 
                 </div>
              </div>
 
-             <div className="mt-10 mb-6 text-center shrink-0">
-                <button 
+             <div className="mt-10 mb-6 flex flex-col items-center gap-3 shrink-0 sm:flex-row sm:justify-center">
+                {userPackId ? (
+                  <Link
+                    href={`/verify/${userPackId}`}
+                    className="inline-flex items-center gap-2 rounded-full border border-emerald-400/40 bg-emerald-500/10 px-6 py-3 text-xs font-black uppercase tracking-widest text-emerald-200 transition hover:scale-[1.03] hover:bg-emerald-500/15 active:scale-95"
+                  >
+                    <ShieldCheck className="h-4 w-4" /> Verify Fairness
+                  </Link>
+                ) : null}
+                <button
                   onClick={onClose}
                   className="px-12 py-4 rounded-full bg-white text-slate-950 font-black uppercase tracking-widest hover:scale-105 active:scale-95 transition-all shadow-[0_10px_30px_rgba(255,255,255,0.2)]"
                 >

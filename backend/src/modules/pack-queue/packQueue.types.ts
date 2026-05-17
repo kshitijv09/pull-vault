@@ -6,6 +6,11 @@ export interface QueuePackPurchaseBody {
    * Redis assigns sequentially across those rows.
    */
   tierId: string;
+  /**
+   * Phase 1 fairness session id (from `POST /drops/:dropId/fairness-commit`).
+   * Required when the drop is in `fairness` mode; ignored when `legacy`.
+   */
+  nonce?: string;
 }
 
 export interface PackPurchaseQueuePayload extends QueuePackPurchaseBody {

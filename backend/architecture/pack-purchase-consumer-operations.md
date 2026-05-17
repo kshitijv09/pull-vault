@@ -17,12 +17,12 @@ The consumer is responsible for the authoritative fulfillment phase after a pack
   1. Pop queue message (`BLPOP`).
   2. Validate payload (`userId`, `tierId`, `dropId`, `packId`).
   3. Begin DB transaction.
-  4. Lock target `pack_inventory` + pack row, validate availability and drop match.
-  5. Load catalog cards for selected pack.
+  4. Lock target `pack_inventory` + pack row, validate **`pack_inventory.status === in_drop_sale`** (listed in drop) and drop match.
+  5. Load catalog cards for selected pack (`pack_card` for the pack template). Asserts `len(pack_card) === packs.cards_per_pack` and `cards_per_pack === PACK_GENERATOR_CARDS_PER_PACK` (**3**) so fulfillment matches **`StandardGenerationStrategy`** output from `POST /pack-generator/packs`.
   6. Resolve acquisition prices (TCG near_mint when available, fallback to catalog value).
   7. Lock user wallet row and validate sufficient balance.
   8. Debit user wallet.
-  9. Mark inventory row as sold.
+  9. Mark inventory row **`owned`** (`pack_inventory.status`, was `sold` / `available` in older schemas).
   10. Insert `user_packs` record.
   11. Insert `user_cards` rows.
   12. Record company earnings ledger for pack purchase.

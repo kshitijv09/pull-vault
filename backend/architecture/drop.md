@@ -13,7 +13,7 @@ This separation keeps drop-time contention low while preserving transactional co
 
 ### Phase 0: Data model
 
-- Core tables: `drops`, `packs`, `pack_inventory`, `pack_card`, `card`, `user_packs`, `user_cards`.
+- Core tables: `drops`, `packs`, `pack_inventory` (per-unit lifecycle: `created` → `in_drop_sale` → `reserved` → `owned`, plus `legacy`), `pack_card`, `card`, `user_packs`, `user_cards`.
 
 ### Phase 1: Startup prefetch + Redis seed
 

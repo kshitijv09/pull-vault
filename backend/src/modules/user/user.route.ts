@@ -5,6 +5,8 @@ import { UserService } from "./user.service";
 import { DropController } from "../drop/drop.controller";
 import { DropService } from "../drop/drop.service";
 import { DropRepository } from "../drop/drop.repository";
+import { PackFairnessCommitRepository } from "../drop/packFairnessCommit.repository";
+import { PackFairnessCommitService } from "../drop/packFairnessCommit.service";
 import { ShardedRedisPackCounter } from "../../infra/redis/shardedRedisPackCounter";
 
 import { authMiddleware } from "../../shared/middleware/authMiddleware";
@@ -15,9 +17,13 @@ import { MarketplaceController } from "../marketplace/marketplace.controller";
 
 const userRepository = new UserRepository();
 const dropRepository = new DropRepository();
+const packFairnessCommitService = new PackFairnessCommitService(
+  dropRepository,
+  new PackFairnessCommitRepository()
+);
 const packCounter = new ShardedRedisPackCounter();
 const dropService = new DropService(dropRepository, userRepository, packCounter);
-const dropController = new DropController(dropService);
+const dropController = new DropController(dropService, packFairnessCommitService);
 const userService = new UserService(userRepository);
 const userController = new UserController(userService);
 

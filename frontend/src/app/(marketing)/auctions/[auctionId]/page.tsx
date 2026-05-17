@@ -9,7 +9,8 @@ import {
   getPublicUserProfiles,
   initAuctionBidSession,
   placeAuctionBid,
-  restoreAuctionOutbidWallet,
+  placeAuctionSealedBid,
+  // restoreAuctionOutbidWallet,
   type AuctionListing,
   type AuctionSocketMessage
 } from "@/lib/api";
@@ -25,6 +26,7 @@ type RealtimeState = {
 
 type FinalizedHighlight = {
   cardName: string;
+  winnerUserId: string;
   winnerName: string;
   winningBidUsd: string;
 };
@@ -79,7 +81,7 @@ export default function AuctionRoomPage({ params }: { params: { auctionId: strin
   const [bidInputUsd, setBidInputUsd] = useState("");
   const [isSessionLoading, setIsSessionLoading] = useState(false);
   const [isBidSubmitting, setIsBidSubmitting] = useState(false);
-  const [isRestoreSubmitting, setIsRestoreSubmitting] = useState(false);
+  // const [isRestoreSubmitting, setIsRestoreSubmitting] = useState(false);
   const [finalizedHighlight, setFinalizedHighlight] = useState<FinalizedHighlight | null>(null);
   const [userNamesById, setUserNamesById] = useState<Record<string, string>>(() =>
     user?.id ? { [user.id]: user.fullName } : {}
@@ -88,8 +90,16 @@ export default function AuctionRoomPage({ params }: { params: { auctionId: strin
   const autoInitInFlightRef = useRef(false);
   const userNameFetchInFlightRef = useRef<Set<string>>(new Set());
   const latestMinBidRef = useRef<string | null>(null);
+  const sealedPhaseActiveRef = useRef(false);
+
+  const [sealedPhaseActive, setSealedPhaseActive] = useState(false);
+  const [hasSubmittedSealedBid, setHasSubmittedSealedBid] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
+
+  useEffect(() => {
+    sealedPhaseActiveRef.current = sealedPhaseActive;
+  }, [sealedPhaseActive]);
 
   const loadListing = useCallback(async () => {
     setLoading(true);
@@ -163,6 +173,8 @@ export default function AuctionRoomPage({ params }: { params: { auctionId: strin
 
         if (msg.type === "auction_snapshot") {
           const previousMinBid = latestMinBidRef.current;
+          const snapSealed = Boolean(msg.sealedPhaseActive ?? false);
+          setSealedPhaseActive(snapSealed);
           setRealtime({
             currentBidUsd: msg.currentBidUsd,
             currentBidderId: msg.currentBidderId,
@@ -186,21 +198,30 @@ export default function AuctionRoomPage({ params }: { params: { auctionId: strin
 
         if (msg.type === "auction_bid_updated") {
           const previousMinBid = latestMinBidRef.current;
+          const enteringSealed = Boolean(msg.sealedPhaseActive);
+          setSealedPhaseActive((s) => s || enteringSealed);
+          const bidFieldsLocked = sealedPhaseActiveRef.current && !enteringSealed;
           setRealtime((prev) => ({
             ...prev,
-            currentBidUsd: msg.bidUsd,
-            currentBidderId: msg.bidderId,
-            endTime: msg.endTime,
-            minNextBidUsd: msg.minNextBidUsd
+            ...(bidFieldsLocked
+              ? {}
+              : {
+                  currentBidUsd: msg.bidUsd,
+                  currentBidderId: msg.bidderId,
+                  minNextBidUsd: msg.minNextBidUsd
+                }),
+            endTime: msg.endTime
           }));
-          latestMinBidRef.current = msg.minNextBidUsd;
-          setBidInputUsd((prev) => {
-            const trimmed = prev.trim();
-            if (!trimmed || (previousMinBid && trimmed === previousMinBid)) {
-              return msg.minNextBidUsd;
-            }
-            return prev;
-          });
+          if (!bidFieldsLocked) {
+            latestMinBidRef.current = msg.minNextBidUsd;
+            setBidInputUsd((prev) => {
+              const trimmed = prev.trim();
+              if (!trimmed || (previousMinBid && trimmed === previousMinBid)) {
+                return msg.minNextBidUsd;
+              }
+              return prev;
+            });
+          }
           const myWalletUpdate = msg.walletUpdates?.find((update) => update.userId === user?.id);
           if (myWalletUpdate) {
             setWalletBalanceUsd(myWalletUpdate.walletBalanceUsd);
@@ -208,6 +229,13 @@ export default function AuctionRoomPage({ params }: { params: { auctionId: strin
           setListing((prev) =>
             prev ? { ...prev, endTime: msg.endTime, status: "live" } : prev
           );
+          return;
+        }
+
+        if (msg.type === "auction_sealed_phase_started") {
+          setSealedPhaseActive(true);
+          setRealtime((prev) => ({ ...prev, endTime: msg.endTime }));
+          setListing((prev) => (prev ? { ...prev, endTime: msg.endTime } : prev));
           return;
         }
 
@@ -228,10 +256,27 @@ export default function AuctionRoomPage({ params }: { params: { auctionId: strin
               : prev
           );
           if (msg.status === "sold" && msg.winnerUserId && msg.winningBidUsd) {
-            const winnerNameFromMap = userNamesById[msg.winnerUserId];
+            const winnerId = msg.winnerUserId;
+            const winnerNameFromMap = userNamesById[winnerId];
+            const winnerName = msg.winnerName ?? winnerNameFromMap ?? "Winner";
+            if (!msg.winnerName && !winnerNameFromMap) {
+              void getPublicUserProfiles([winnerId])
+                .then((profiles) => {
+                  const profile = profiles.find((p) => p.id === winnerId);
+                  if (!profile?.fullName) return;
+                  setUserNamesById((prev) => ({ ...prev, [winnerId]: profile.fullName }));
+                  setFinalizedHighlight((prev) =>
+                    prev?.winnerUserId === winnerId ? { ...prev, winnerName: profile.fullName } : prev
+                  );
+                })
+                .catch(() => {
+                  // Keep fallback winner label.
+                });
+            }
             setFinalizedHighlight({
               cardName: msg.cardName ?? listing?.cardName ?? "Card",
-              winnerName: msg.winnerName ?? winnerNameFromMap ?? "Winner",
+              winnerUserId: winnerId,
+              winnerName,
               winningBidUsd: msg.winningBidUsd
             });
           }
@@ -317,6 +362,8 @@ export default function AuctionRoomPage({ params }: { params: { auctionId: strin
       setMinBidUsd(data.minBidUsd);
       setBidInputUsd(data.minBidUsd);
       latestMinBidRef.current = data.minBidUsd;
+      setSealedPhaseActive(Boolean(data.sealedPhaseActive));
+      setHasSubmittedSealedBid(Boolean(data.hasSubmittedSealedBid));
       setRealtime((prev) => ({
         ...prev,
         endTime: data.endTime,
@@ -349,6 +396,22 @@ export default function AuctionRoomPage({ params }: { params: { auctionId: strin
     })();
   }, [canBid, initBidSession, listing?.id, token]);
 
+  useEffect(() => {
+    if (!sealedPhaseActive || !listing?.id || !token) {
+      return;
+    }
+    void (async () => {
+      try {
+        const data = await initAuctionBidSession(listing.id!);
+        setHasSubmittedSealedBid(Boolean(data.hasSubmittedSealedBid));
+      } catch {
+        // Non-fatal: bid button still guarded after successful submit.
+      }
+    })();
+  }, [listing?.id, sealedPhaseActive, token]);
+
+  const sealedBidLocked = sealedPhaseActive && hasSubmittedSealedBid;
+
   const handlePlaceBid = async () => {
     if (!listing) return;
     setIsBidSubmitting(true);
@@ -370,7 +433,16 @@ export default function AuctionRoomPage({ params }: { params: { auctionId: strin
       setListing((prev) =>
         prev ? { ...prev, endTime: placed.endTime, status: "live" } : prev
       );
-      setFlash(placed.antiSnipingApplied ? "Bid accepted and anti-sniping extension applied." : "Bid accepted.");
+      setFlash(
+        placed.sealedPhaseStarted
+          ? "Bid accepted. Sealed-bid phase has started — further bids are confidential."
+          : placed.antiSnipingApplied
+            ? "Bid accepted and anti-sniping extension applied."
+            : "Bid accepted."
+      );
+      if (placed.sealedPhaseStarted) {
+        setSealedPhaseActive(true);
+      }
     } catch (e) {
       setError(e instanceof ApiRequestError ? e.message : "Could not place bid.");
     } finally {
@@ -378,20 +450,40 @@ export default function AuctionRoomPage({ params }: { params: { auctionId: strin
     }
   };
 
-  const handleManualRestore = async () => {
-    if (!listing || !currentBid) return;
-    setIsRestoreSubmitting(true);
+  const handlePlaceSealedBid = async () => {
+    if (!listing) return;
+    setIsBidSubmitting(true);
     setError(null);
+    setFlash(null);
     try {
-      const data = await restoreAuctionOutbidWallet(listing.id!, currentBid);
-      setWalletBalanceUsd(data.walletBalanceUsd);
-      setFlash("Outbid restore request processed.");
+      const placed = await placeAuctionSealedBid(listing.id!, { biddingPriceUsd: bidInputUsd.trim() });
+      setWalletBalanceUsd(placed.walletBalanceUsd);
+      setHasSubmittedSealedBid(true);
+      setRealtime((prev) => ({ ...prev, endTime: placed.endTime }));
+      setListing((prev) => (prev ? { ...prev, endTime: placed.endTime } : prev));
+      setFlash("Sealed bid submitted. Amount stays hidden until the auction ends.");
     } catch (e) {
-      setError(e instanceof ApiRequestError ? e.message : "Could not restore wallet.");
+      setError(e instanceof ApiRequestError ? e.message : "Could not submit sealed bid.");
     } finally {
-      setIsRestoreSubmitting(false);
+      setIsBidSubmitting(false);
     }
   };
+
+  // Manual outbid restore disabled — automatic restore runs in place_auction_bid.lua on the next bid.
+  // const handleManualRestore = async () => {
+  //   if (!listing || !currentBid) return;
+  //   setIsRestoreSubmitting(true);
+  //   setError(null);
+  //   try {
+  //     const data = await restoreAuctionOutbidWallet(listing.id!, currentBid);
+  //     setWalletBalanceUsd(data.walletBalanceUsd);
+  //     setFlash("Outbid restore request processed.");
+  //   } catch (e) {
+  //     setError(e instanceof ApiRequestError ? e.message : "Could not restore wallet.");
+  //   } finally {
+  //     setIsRestoreSubmitting(false);
+  //   }
+  // };
 
   if (loading) {
     return <div className="mx-auto max-w-5xl px-4 py-10 text-sm text-slate-400">Loading auction room...</div>;
@@ -408,17 +500,41 @@ export default function AuctionRoomPage({ params }: { params: { auctionId: strin
     );
   }
 
+  const isAuctionWinner =
+    Boolean(user?.id) &&
+    Boolean(finalizedHighlight?.winnerUserId) &&
+    user!.id === finalizedHighlight!.winnerUserId;
+
   return (
     <div className="mx-auto max-w-6xl px-4 pb-16 pt-8">
       {finalizedHighlight ? (
         <div className="pointer-events-none fixed inset-x-0 top-6 z-50 flex justify-center px-4">
-          <div className="w-full max-w-xl rounded-2xl border border-amber-300/50 bg-gradient-to-r from-amber-500/20 via-emerald-400/10 to-sky-400/20 px-5 py-4 shadow-2xl backdrop-blur">
-            <p className="text-xs uppercase tracking-[0.2em] text-amber-200">Auction Won</p>
-            <p className="mt-1 text-lg font-semibold text-white">{finalizedHighlight.cardName}</p>
-            <p className="text-sm text-slate-200">
-              <span className="font-semibold text-emerald-200">{finalizedHighlight.winnerName}</span> won at{" "}
-              <span className="font-semibold text-amber-200">{formatUsd(finalizedHighlight.winningBidUsd)}</span>
-            </p>
+          <div
+            className={`w-full max-w-xl rounded-2xl px-5 py-4 shadow-2xl backdrop-blur ${
+              isAuctionWinner
+                ? "border border-emerald-300/50 bg-gradient-to-r from-emerald-500/25 via-amber-400/15 to-sky-400/15"
+                : "border border-amber-300/50 bg-gradient-to-r from-amber-500/20 via-emerald-400/10 to-sky-400/20"
+            }`}
+          >
+            {isAuctionWinner ? (
+              <>
+                <p className="text-xs uppercase tracking-[0.2em] text-emerald-200">You won</p>
+                <p className="mt-1 text-lg font-semibold text-white">{finalizedHighlight.cardName}</p>
+                <p className="text-sm text-slate-200">
+                  Your winning bid:{" "}
+                  <span className="font-semibold text-amber-200">{formatUsd(finalizedHighlight.winningBidUsd)}</span>
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="text-xs uppercase tracking-[0.2em] text-amber-200">Auction ended</p>
+                <p className="mt-1 text-lg font-semibold text-white">{finalizedHighlight.cardName}</p>
+                <p className="text-sm text-slate-200">
+                  <span className="font-semibold text-emerald-200">{finalizedHighlight.winnerName}</span> won with{" "}
+                  <span className="font-semibold text-amber-200">{formatUsd(finalizedHighlight.winningBidUsd)}</span>
+                </p>
+              </>
+            )}
           </div>
         </div>
       ) : null}
@@ -436,6 +552,16 @@ export default function AuctionRoomPage({ params }: { params: { auctionId: strin
       {flash ? <div className="mb-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200">{flash}</div> : null}
       {error ? <div className="mb-4 rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-200">{error}</div> : null}
 
+      {sealedPhaseActive && slotLive && listing.status === "live" ? (
+        <div className="mb-4 rounded-xl border border-violet-500/35 bg-violet-500/10 px-4 py-3 text-sm text-violet-100">
+          <p className="font-semibold text-white">Sealed-bid phase</p>
+          <p className="mt-1 text-violet-200/90">
+            Bid amounts are hidden until the auction ends. The last public high bid is frozen on screen; submit one sealed bid
+            per account before the timer expires.
+          </p>
+        </div>
+      ) : null}
+
       <div className="grid gap-6 lg:grid-cols-[1fr,1.1fr]">
         <section className="rounded-2xl border border-white/10 bg-surface-raised p-5">
           <div className="relative mx-auto aspect-[4/3] max-w-md rounded-xl border border-white/10 bg-slate-950/80">
@@ -452,14 +578,23 @@ export default function AuctionRoomPage({ params }: { params: { auctionId: strin
           <div className="mt-4 grid grid-cols-2 gap-3">
             <div className="rounded-xl border border-white/10 bg-white/5 px-4 py-3">
               <p className="text-xs uppercase tracking-wide text-slate-500">Current bid</p>
-              <p className="mt-1 text-3xl font-extrabold text-accent">{formatUsd(currentBid)}</p>
+              <p
+                className={`mt-1 text-3xl font-extrabold text-accent ${sealedPhaseActive ? "opacity-50 line-through decoration-slate-500" : ""}`}
+              >
+                {formatUsd(currentBid)}
+              </p>
+              {sealedPhaseActive ? (
+                <p className="mt-1 text-xs text-violet-300/90">Last public bid (frozen)</p>
+              ) : null}
             </div>
             <div className="rounded-xl border border-white/10 bg-white/5 px-4 py-3">
               <p className="text-xs uppercase tracking-wide text-slate-500">Live viewers</p>
               <p className="mt-1 text-3xl font-extrabold text-white">{slotLive ? viewerCount : 0}</p>
             </div>
             <div className="rounded-xl border border-white/10 bg-white/5 px-4 py-3">
-              <p className="text-xs uppercase tracking-wide text-slate-500">Min bid</p>
+              <p className="text-xs uppercase tracking-wide text-slate-500">
+                {sealedPhaseActive ? "Min sealed bid" : "Min bid"}
+              </p>
               <p className="mt-1 text-2xl font-bold text-white">{slotLive ? formatUsd(minNextBid) : "—"}</p>
             </div>
             <div className="rounded-xl border border-white/10 bg-white/5 px-4 py-3">
@@ -502,26 +637,39 @@ export default function AuctionRoomPage({ params }: { params: { auctionId: strin
                   onChange={(e) => setBidInputUsd(e.target.value)}
                   placeholder={minNextBid ?? "Bid USD"}
                   className="mt-4 w-full rounded-xl border border-white/15 bg-slate-950 px-4 py-3 text-lg text-white"
-                  disabled={!canBid || isSessionLoading || isBidSubmitting || isRestoreSubmitting}
+                  disabled={!canBid || isSessionLoading || isBidSubmitting || sealedBidLocked}
                 />
                 {isSessionLoading ? (
                   <p className="mt-3 text-xs text-slate-400">Loading bid session...</p>
                 ) : null}
+                {sealedBidLocked ? (
+                  <p className="mt-3 text-xs text-violet-300/90">
+                    Your sealed bid is locked in. You cannot submit another bid for this auction.
+                  </p>
+                ) : null}
 
                 <button
                   type="button"
-                  onClick={() => void handlePlaceBid()}
+                  onClick={() => void (sealedPhaseActive ? handlePlaceSealedBid() : handlePlaceBid())}
                   disabled={
                     isSessionLoading ||
                     isBidSubmitting ||
-                    isRestoreSubmitting ||
+                    sealedBidLocked ||
                     !bidInputUsd.trim() ||
                     !canBid ||
-                    isHighestBidder
+                    (!sealedPhaseActive && isHighestBidder)
                   }
                   className="mt-4 w-full rounded-xl bg-accent px-6 py-4 text-xl font-extrabold text-slate-950 disabled:opacity-50"
                 >
-                  {isBidSubmitting ? "Placing bid..." : "PLACE BID"}
+                  {isBidSubmitting
+                    ? sealedPhaseActive
+                      ? "Submitting sealed bid..."
+                      : "Placing bid..."
+                    : sealedBidLocked
+                      ? "SEALED BID SUBMITTED"
+                      : sealedPhaseActive
+                        ? "SUBMIT SEALED BID"
+                        : "PLACE BID"}
                 </button>
                 <div className="group relative mt-3 inline-flex items-center gap-2 text-xs text-slate-400">
                   <button
@@ -540,6 +688,7 @@ export default function AuctionRoomPage({ params }: { params: { auctionId: strin
                   </div>
                 </div>
 
+                {/* Manual outbid restore — recovery-only; outbid refunds are automatic on the next bid.
                 <button
                   type="button"
                   onClick={() => void handleManualRestore()}
@@ -548,6 +697,7 @@ export default function AuctionRoomPage({ params }: { params: { auctionId: strin
                 >
                   {isRestoreSubmitting ? "Restoring wallet..." : "Manual outbid restore"}
                 </button>
+                */}
 
                 <div className="mt-4 grid gap-2 rounded-lg border border-white/10 bg-slate-950/40 p-3 text-xs text-slate-300">
                   <p className="text-slate-400">Ends at {formatDateTime(endTime ?? undefined)}</p>
