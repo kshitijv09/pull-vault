@@ -1,6 +1,23 @@
-import { getClient } from "../../db";
+import { getClient, query } from "../../db";
 
 export class TcgCatalogRepository {
+  async findExistingExternalCardIds(externalCardIds: string[]): Promise<Set<string>> {
+    const ids = [...new Set(externalCardIds.map((id) => id.trim()).filter(Boolean))];
+    if (ids.length === 0) {
+      return new Set();
+    }
+
+    const res = await query<{ card_id: string }>(
+      `
+        SELECT card_id
+        FROM card
+        WHERE card_id = ANY($1::text[])
+      `,
+      [ids]
+    );
+    return new Set(res.rows.map((r) => r.card_id.trim()));
+  }
+
   async insertCatalogCards(
     rows: Array<{
       externalCardId: string;
@@ -58,13 +75,7 @@ export class TcgCatalogRepository {
               market_value_usd
             )
             VALUES ($1, $2, $3, $4, $5, $6::numeric)
-            ON CONFLICT (card_id) DO UPDATE
-            SET
-              name = EXCLUDED.name,
-              card_set = EXCLUDED.card_set,
-              image_url = EXCLUDED.image_url,
-              rarity = EXCLUDED.rarity,
-              market_value_usd = EXCLUDED.market_value_usd
+            ON CONFLICT (card_id) DO NOTHING
             RETURNING id, card_id, name, card_set, image_url, rarity, market_value_usd
           `,
           [

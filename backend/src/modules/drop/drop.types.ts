@@ -4,6 +4,9 @@ export interface Drop {
   startTime: string;
   durationMinutes: number;
   status: "upcoming" | "live" | "ended";
+  /** "fairness" (provably-fair commit-reveal) or "legacy" (read cards from pack_card). */
+  fairnessMode: "fairness" | "legacy";
+  fairnessAlgorithmVersion: string;
   createdAt: string;
   updatedAt: string;
 }

@@ -1,4 +1,5 @@
 import { getClient, query } from "../../db";
+import { PACK_INVENTORY_STATUS } from "../../shared/constants/packInventoryStatus.constants";
 import {
   CreateDropInput,
   Drop,
@@ -8,6 +9,8 @@ import {
   PackDropPurchaseRequest
 } from "./drop.types";
 import type { PackRemainingSeedRow, TierQueueSeed } from "../../infra/redis/shardedRedisPackCounter";
+
+const SQL_PI_IN_DROP = `'${PACK_INVENTORY_STATUS.IN_DROP_SALE}'`;
 
 export class DropRepository {
   async create(input: CreateDropInput): Promise<Drop> {
@@ -50,9 +53,9 @@ export class DropRepository {
           await client.query(
             `
               INSERT INTO pack_inventory (pack_id, drop_id, status)
-              VALUES ($1::uuid, $2::uuid, 'available')
+              VALUES ($1::uuid, $2::uuid, $3)
             `,
-            [row.id, drop.id]
+            [row.id, drop.id, PACK_INVENTORY_STATUS.IN_DROP_SALE]
           );
         }
       }
@@ -77,7 +80,7 @@ export class DropRepository {
         p.start_time,
         p.rarity_weights, d.id AS drop_id, p.created_at, p.updated_at
       FROM drops d
-      INNER JOIN pack_inventory pi2 ON pi2.drop_id = d.id AND pi2.status = 'available'
+      INNER JOIN pack_inventory pi2 ON pi2.drop_id = d.id AND pi2.status = ${SQL_PI_IN_DROP}
       INNER JOIN packs p ON p.id = pi2.pack_id
       GROUP BY d.id, p.tier_name, p.price, p.cards_per_pack, p.start_time, p.rarity_weights, p.created_at, p.updated_at
     `);
@@ -99,7 +102,7 @@ export class DropRepository {
         p.start_time,
         p.rarity_weights, p.created_at, p.updated_at
       FROM packs p
-      INNER JOIN pack_inventory pi2 ON pi2.pack_id = p.id AND pi2.status = 'available' AND pi2.drop_id IS NOT NULL
+      INNER JOIN pack_inventory pi2 ON pi2.pack_id = p.id AND pi2.status = ${SQL_PI_IN_DROP} AND pi2.drop_id IS NOT NULL
       GROUP BY p.tier_name, p.price, p.cards_per_pack, p.start_time, p.rarity_weights, p.created_at, p.updated_at
       ORDER BY p.start_time ASC, p.tier_name ASC
     `);
@@ -178,7 +181,7 @@ export class DropRepository {
         FROM pack_inventory pi
         INNER JOIN packs p ON p.id = pi.pack_id
         WHERE pi.drop_id = $1::uuid
-          AND pi.status = 'available'
+          AND pi.status = ${SQL_PI_IN_DROP}
         ORDER BY p.tier_name ASC, pi.created_at ASC, pi.id ASC
       `,
       [dropId]
@@ -268,12 +271,19 @@ export class DropRepository {
   }
 
   private mapDropRow(row: any): Drop {
+    const fairnessMode =
+      row.fairness_mode === "legacy" ? "legacy" : "fairness";
     return {
       id: row.id,
       name: row.name,
       startTime: row.start_time instanceof Date ? row.start_time.toISOString() : row.start_time,
       durationMinutes: row.duration_minutes,
       status: row.status,
+      fairnessMode,
+      fairnessAlgorithmVersion:
+        typeof row.fairness_algorithm_version === "string" && row.fairness_algorithm_version.length > 0
+          ? row.fairness_algorithm_version
+          : "standard_v1",
       createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
       updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at
     };

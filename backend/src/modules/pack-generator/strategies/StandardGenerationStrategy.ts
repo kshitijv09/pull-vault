@@ -1,54 +1,72 @@
 import Decimal from "decimal.js";
 import type { CatalogCard, GeneratedPack, GeneratedPackCard } from "../packGenerator.types";
-import type { CandidateCard, PackGenerationStrategy } from "./PackGenerationStrategy";
+import type { CandidateCard, PackGenerationStrategy, RandomSource } from "./PackGenerationStrategy";
+import { effectiveRetailSwingProbability, packGeneratorConfig } from "../packGenerator.config";
 
 // ── Probability constants ────────────────────────────────────────────────────
-const GOD_HIT_PROBABILITY = 0.15;        // 15% chance of god-hit anchor selection
-const THIRD_CARD_PROBABILITY = 0.15;     // 15% chance of adding a third card
+const GOD_HIT_PROBABILITY = 0.1;
+const SWING_RANDOM_TRIES = 480;
 
 // ── Anchor selection ratios (as fraction of TPV) ────────────────────────────
 const GOD_HIT_ANCHOR_MIN_RATIO = 0.65;
 const GOD_HIT_ANCHOR_MAX_RATIO = 0.85;
 const STANDARD_ANCHOR_MIN_RATIO = 0.4;
 const STANDARD_ANCHOR_MAX_RATIO = 0.6;
-const VETO_MIN_RATIO = 0.55;             // below this → prefer higher stabilizer
+const VETO_MIN_RATIO = 0.55;
 
-// ── Stabilizer selection ratio (as fraction of remaining balance) ────────────
 const STEP2_MIN_RATIO = 0.7;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Tier anchor windows keyed to updated retail prices:
-//   Elite    = $12,000 (TPV $9,600)
-//   Pinnacle = $18,000 (TPV $14,400)
-//   Zenith   = $26,000 (TPV $20,800)
-// ─────────────────────────────────────────────────────────────────────────────
 type TierWindow = { anchorMinUsd: Decimal; anchorMaxUsd: Decimal };
 
 const TIER_WINDOWS: TierWindow[] = [
-  { anchorMinUsd: new Decimal(4575), anchorMaxUsd: new Decimal(5400) },  // Elite   (TPV ~$9,600)
-  { anchorMinUsd: new Decimal(5857), anchorMaxUsd: new Decimal(8000) },  // Pinnacle (TPV ~$14,400)
-  { anchorMinUsd: new Decimal(8147), anchorMaxUsd: new Decimal(12000) }  // Zenith  (TPV ~$20,800)
+  { anchorMinUsd: new Decimal(4575), anchorMaxUsd: new Decimal(5400) },
+  { anchorMinUsd: new Decimal(5857), anchorMaxUsd: new Decimal(8000) },
+  { anchorMinUsd: new Decimal(8147), anchorMaxUsd: new Decimal(12000) }
 ];
 
 export class StandardGenerationStrategy implements PackGenerationStrategy {
   public readonly name = "standard";
 
-  generateOnePack(candidates: CandidateCard[], targetPackValue: Decimal, sequence: number): GeneratedPack {
+  generateOnePack(
+    candidates: CandidateCard[],
+    targetPackValue: Decimal,
+    sequence: number,
+    retailPrice: Decimal,
+    dryStreakSinceRetailWin: number,
+    rand: RandomSource = Math.random
+  ): GeneratedPack {
+    const pSwing = Math.min(
+      effectiveRetailSwingProbability(dryStreakSinceRetailWin),
+      1 - GOD_HIT_PROBABILITY - 1e-9
+    );
+    const zoneGod = pSwing + GOD_HIT_PROBABILITY;
+    const u = rand();
+
+    if (u < pSwing) {
+      const swing = this.tryRetailSwingPack(candidates, sequence, targetPackValue, retailPrice, rand);
+      if (swing) return swing;
+    }
+
+    const isGodHit = u < zoneGod;
+
     const selected = new Set<string>();
     const cards: GeneratedPackCard[] = [];
 
-    // Compute the max value the anchor can take so the remaining budget can always
-    // accommodate the cheapest card in the pool as the stabilizer.
-    // This is the core guard that prevents the stabilizer from having to overshoot.
     const cheapest = this.cheapestCard(candidates);
+    const reserveTwo = this.sumTwoSmallest(candidates);
+    const maxAnchorForThree =
+      reserveTwo !== null
+        ? Decimal.max(new Decimal(0), targetPackValue.minus(reserveTwo))
+        : targetPackValue;
     const maxAnchorBudget = cheapest
-      ? Decimal.max(new Decimal(0), targetPackValue.minus(cheapest.marketValue))
-      : targetPackValue;
+      ? Decimal.min(
+          Decimal.max(new Decimal(0), targetPackValue.minus(cheapest.marketValue)),
+          maxAnchorForThree
+        )
+      : maxAnchorForThree;
 
     const tierWindow = this.resolveTierWindow(targetPackValue);
-    const isGodHit = Math.random() < GOD_HIT_PROBABILITY;
 
-    // ── Step 1: Anchor ───────────────────────────────────────────────────────
     const anchor = isGodHit
       ? this.pickGodHitAnchor(candidates, selected, targetPackValue, tierWindow, maxAnchorBudget)
       : this.pickStandardAnchor(candidates, selected, targetPackValue, tierWindow, maxAnchorBudget);
@@ -68,17 +86,17 @@ export class StandardGenerationStrategy implements PackGenerationStrategy {
 
     const afterAnchor = Decimal.max(new Decimal(0), targetPackValue.minus(anchor.marketValue));
 
-    // ── Step 2: Stabilizer — strictly at-or-below remaining budget ───────────
-    // Never picks above remaining; if anchor was properly capped the cheapest card
-    // always fits here, guaranteeing a valid 2-card pack in ~85%+ of cases.
     if (afterAnchor.greaterThan(0)) {
       const vetoLowRoll = anchor.marketValue.lessThan(targetPackValue.mul(VETO_MIN_RATIO));
       const minStep2 = afterAnchor.mul(vetoLowRoll ? Math.max(STEP2_MIN_RATIO, VETO_MIN_RATIO) : STEP2_MIN_RATIO);
-      const preferred = this.filterByRange(this.excludeSelected(candidates, selected), minStep2, afterAnchor);
-      const stabilizer =
-        preferred.length > 0
-          ? this.pickClosestTo(preferred, afterAnchor)
-          : this.pickBestAtOrBelow(this.excludeSelected(candidates, selected), afterAnchor);
+      const poolAfterAnchor = this.excludeSelected(candidates, selected);
+      const stabilizer = this.pickStabilizerAllowingThird(
+        poolAfterAnchor,
+        minStep2,
+        afterAnchor,
+        candidates,
+        selected
+      );
 
       if (stabilizer) {
         selected.add(stabilizer.card.cardId);
@@ -86,17 +104,18 @@ export class StandardGenerationStrategy implements PackGenerationStrategy {
       }
     }
 
-    // ── Step 3: Optional third card (15% probability) ────────────────────────
-    // Strictly at-or-below remaining budget; skipped if nothing fits.
-    if (cards.length < 3 && Math.random() < THIRD_CARD_PROBABILITY) {
-      const thirdBudget = this.remainingBudget(targetPackValue, cards);
-      if (thirdBudget.greaterThan(0)) {
-        const third = this.pickBestAtOrBelow(this.excludeSelected(candidates, selected), thirdBudget);
-        if (third) {
-          selected.add(third.card.cardId);
-          cards.push(this.asGeneratedCard(third.card, "bulk"));
-        }
-      }
+    while (cards.length < 3) {
+      const budget = this.remainingBudget(targetPackValue, cards);
+      if (budget.lessThanOrEqualTo(0)) break;
+      const pool = this.excludeSelected(candidates, selected);
+      const next =
+        cards.length === 2
+          ? this.pickBestAtOrBelow(pool, budget) ?? this.pickSmallestAtOrBelow(pool, budget)
+          : this.pickSmallestStabilizerAllowingThird(pool, budget, candidates, selected);
+      if (!next) break;
+      selected.add(next.card.cardId);
+      const slot: GeneratedPackCard["slot"] = cards.length === 1 ? "stabilizer" : "bulk";
+      cards.push(this.asGeneratedCard(next.card, slot));
     }
 
     const totalValue = this.sumGeneratedCardValues(cards);
@@ -109,7 +128,128 @@ export class StandardGenerationStrategy implements PackGenerationStrategy {
     };
   }
 
-  // ── Tier window resolution ───────────────────────────────────────────────────
+  /** Realised value in `[retail, retail × retailSwingPackValueCapRatio]` — **exactly 3 cards**. */
+  private tryRetailSwingPack(
+    candidates: CandidateCard[],
+    sequence: number,
+    targetPackValue: Decimal,
+    retailPrice: Decimal,
+    rand: RandomSource
+  ): GeneratedPack | null {
+    const cap = retailPrice.mul(packGeneratorConfig.retailSwingPackValueCapRatio);
+    if (candidates.length < 3) return null;
+
+    for (let attempt = 0; attempt < SWING_RANDOM_TRIES; attempt++) {
+      const a = candidates[Math.floor(rand() * candidates.length)]!;
+      const b = candidates[Math.floor(rand() * candidates.length)]!;
+      const c = candidates[Math.floor(rand() * candidates.length)]!;
+      if (new Set([a.card.cardId, b.card.cardId, c.card.cardId]).size < 3) continue;
+      const sum = a.marketValue.plus(b.marketValue).plus(c.marketValue);
+      if (sum.greaterThanOrEqualTo(retailPrice) && sum.lessThanOrEqualTo(cap)) {
+        const ordered = [a, b, c].sort((x, y) => y.marketValue.comparedTo(x.marketValue));
+        return {
+          sequence,
+          branch: "retail_swing",
+          targetPackValueUsd: this.toMoneyString(targetPackValue),
+          totalValueUsd: this.toMoneyString(sum),
+          cards: [
+            this.asGeneratedCard(ordered[0]!.card, "anchor"),
+            this.asGeneratedCard(ordered[1]!.card, "stabilizer"),
+            this.asGeneratedCard(ordered[2]!.card, "bulk")
+          ]
+        };
+      }
+    }
+
+    const sorted = [...candidates].sort((x, y) => x.marketValue.comparedTo(y.marketValue));
+    const cheapSlice = sorted.slice(0, Math.min(50, sorted.length));
+    const pricey = sorted.slice(Math.max(0, sorted.length - 50));
+    for (let t = 0; t < 320; t++) {
+      const c0 = cheapSlice[Math.floor(rand() * cheapSlice.length)]!;
+      const c1 = cheapSlice[Math.floor(rand() * cheapSlice.length)]!;
+      const p = pricey[Math.floor(rand() * pricey.length)]!;
+      if (new Set([c0.card.cardId, c1.card.cardId, p.card.cardId]).size < 3) continue;
+      const sum = c0.marketValue.plus(c1.marketValue).plus(p.marketValue);
+      if (sum.greaterThanOrEqualTo(retailPrice) && sum.lessThanOrEqualTo(cap)) {
+        const ordered = [c0, c1, p].sort((x, y) => y.marketValue.comparedTo(x.marketValue));
+        return {
+          sequence,
+          branch: "retail_swing",
+          targetPackValueUsd: this.toMoneyString(targetPackValue),
+          totalValueUsd: this.toMoneyString(sum),
+          cards: [
+            this.asGeneratedCard(ordered[0]!.card, "anchor"),
+            this.asGeneratedCard(ordered[1]!.card, "stabilizer"),
+            this.asGeneratedCard(ordered[2]!.card, "bulk")
+          ]
+        };
+      }
+    }
+    return null;
+  }
+
+  private sumTwoSmallest(candidates: CandidateCard[]): Decimal | null {
+    if (candidates.length < 2) return null;
+    const s = [...candidates].sort((a, b) => a.marketValue.comparedTo(b.marketValue));
+    return s[0]!.marketValue.plus(s[1]!.marketValue);
+  }
+
+  /** Prefer STEP2/VETO band, but only if some third card fits under remaining TPV. */
+  private pickStabilizerAllowingThird(
+    poolAfterAnchor: CandidateCard[],
+    minStep2: Decimal,
+    afterAnchor: Decimal,
+    candidates: CandidateCard[],
+    selected: Set<string>
+  ): CandidateCard | null {
+    const tryOrder: CandidateCard[] = [];
+    const seen = new Set<string>();
+    const preferred = this.filterByRange(poolAfterAnchor, minStep2, afterAnchor);
+    const prefSorted = [...preferred].sort((a, b) =>
+      a.marketValue.minus(afterAnchor).abs().comparedTo(b.marketValue.minus(afterAnchor).abs())
+    );
+    for (const s of prefSorted) {
+      if (seen.has(s.card.cardId)) continue;
+      seen.add(s.card.cardId);
+      tryOrder.push(s);
+    }
+    const restSorted = poolAfterAnchor
+      .filter((c) => !seen.has(c.card.cardId))
+      .sort((a, b) =>
+        a.marketValue.minus(afterAnchor).abs().comparedTo(b.marketValue.minus(afterAnchor).abs())
+      );
+    tryOrder.push(...restSorted);
+
+    for (const stab of tryOrder) {
+      if (stab.marketValue.greaterThan(afterAnchor)) continue;
+      const rem = afterAnchor.minus(stab.marketValue);
+      const sel = new Set(selected);
+      sel.add(stab.card.cardId);
+      const third = this.pickBestAtOrBelow(this.excludeSelected(candidates, sel), rem);
+      if (third) return stab;
+    }
+    return null;
+  }
+
+  /** Ascending-value search for a second card when preferred stabilizer failed. */
+  private pickSmallestStabilizerAllowingThird(
+    pool: CandidateCard[],
+    budget: Decimal,
+    candidates: CandidateCard[],
+    selected: Set<string>
+  ): CandidateCard | null {
+    const sorted = [...pool].sort((a, b) => a.marketValue.comparedTo(b.marketValue));
+    for (const stab of sorted) {
+      if (stab.marketValue.greaterThan(budget)) break;
+      const rem = budget.minus(stab.marketValue);
+      const sel = new Set(selected);
+      sel.add(stab.card.cardId);
+      const third = this.pickBestAtOrBelow(this.excludeSelected(candidates, sel), rem);
+      if (third) return stab;
+    }
+    return null;
+  }
+
   private resolveTierWindow(targetPackValue: Decimal): TierWindow | null {
     return (
       TIER_WINDOWS.find(
@@ -120,7 +260,6 @@ export class StandardGenerationStrategy implements PackGenerationStrategy {
     );
   }
 
-  // ── Anchor pickers ───────────────────────────────────────────────────────────
   private pickGodHitAnchor(
     candidates: CandidateCard[],
     selected: Set<string>,
@@ -148,7 +287,6 @@ export class StandardGenerationStrategy implements PackGenerationStrategy {
     tierWindow: TierWindow | null,
     maxAnchorBudget: Decimal
   ): CandidateCard | null {
-    // Prefer tier window but honour the anchor budget cap
     if (tierWindow) {
       const byTier = this.filterByRange(
         this.excludeSelected(candidates, selected),
@@ -169,17 +307,16 @@ export class StandardGenerationStrategy implements PackGenerationStrategy {
     );
   }
 
-  // ── Pool helpers ─────────────────────────────────────────────────────────────
   private cheapestCard(candidates: CandidateCard[]): CandidateCard | null {
     if (candidates.length === 0) return null;
-    return [...candidates].sort((a, b) => a.marketValue.comparedTo(b.marketValue))[0];
+    return [...candidates].sort((a, b) => a.marketValue.comparedTo(b.marketValue))[0]!;
   }
 
   private pickClosestTo(pool: CandidateCard[], target: Decimal): CandidateCard | null {
     if (pool.length === 0) return null;
     return [...pool].sort((a, b) =>
       a.marketValue.minus(target).abs().comparedTo(b.marketValue.minus(target).abs())
-    )[0];
+    )[0]!;
   }
 
   private pickBestAtOrBelow(pool: CandidateCard[], target: Decimal): CandidateCard | null {
@@ -187,6 +324,13 @@ export class StandardGenerationStrategy implements PackGenerationStrategy {
       .filter((c) => c.marketValue.lessThanOrEqualTo(target))
       .sort((a, b) => target.minus(a.marketValue).abs().comparedTo(target.minus(b.marketValue).abs()));
     return eligible[0] ?? null;
+  }
+
+  private pickSmallestAtOrBelow(pool: CandidateCard[], cap: Decimal): CandidateCard | null {
+    const ok = pool
+      .filter((c) => c.marketValue.lessThanOrEqualTo(cap))
+      .sort((a, b) => a.marketValue.comparedTo(b.marketValue));
+    return ok[0] ?? null;
   }
 
   private filterByRange(pool: CandidateCard[], min: Decimal, max: Decimal): CandidateCard[] {
@@ -197,9 +341,8 @@ export class StandardGenerationStrategy implements PackGenerationStrategy {
     return pool.filter((c) => !selected.has(c.card.cardId));
   }
 
-  // ── Value helpers ────────────────────────────────────────────────────────────
   private sumGeneratedCardValues(cards: GeneratedPackCard[]): Decimal {
-    return cards.reduce((sum, card) => sum.plus(card.marketValueUsd), new Decimal(0));
+    return cards.reduce((sum, card) => sum.plus(new Decimal(card.marketValueUsd)), new Decimal(0));
   }
 
   private remainingBudget(targetPackValue: Decimal, cards: GeneratedPackCard[]): Decimal {

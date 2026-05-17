@@ -10,8 +10,8 @@ const controller = new TcgCatalogController(service);
 export const tcgCatalogRouter = Router();
 
 /**
- * Calls justtcg Pokemon cards feed, then upserts one `card` row per unique external id.
- * Body currently ignored; endpoint imports from:
- * https://api.justtcg.com/v1/cards?game=pokemon
+ * Calls justtcg Pokemon cards feeds (`game=pokemon`, `game=pokemon-japan`), then inserts
+ * one `card` row per new external id (existing rows are left unchanged).
+ * Body currently ignored.
  */
 tcgCatalogRouter.post("/tcg-search-import", controller.importFromTcgSearch);

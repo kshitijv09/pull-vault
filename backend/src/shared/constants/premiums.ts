@@ -11,3 +11,6 @@ export const MARKETPLACE_BUYER_PREMIUM_MULTIPLIER = 1.0;  // buyer pays asking p
 export const MARKETPLACE_SELLER_PREMIUM_RATE = 0.10;  // 10% deducted from seller proceeds
 
 export const PREMIUM_RATE_PERCENT_SCALE = 100;
+
+/** Max bid (open or sealed) relative to JustTCG reference price cached when the slot starts. */
+export const AUCTION_MAX_BID_VS_JUSTTCG_REFERENCE_MULTIPLIER = 10;

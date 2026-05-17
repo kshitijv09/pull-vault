@@ -3,6 +3,10 @@ import { join } from "node:path";
 import Redis from "ioredis";
 import { env } from "../../config/env";
 import type { AuctionBidBroadcastPayload } from "../../modules/auction/auction.types";
+import {
+  AUCTION_ANTI_SNIPING_EXTENSIONS_BEFORE_SEALED,
+  AUCTION_SEALED_PHASE_MIN_DURATION_MS
+} from "../../shared/constants/auctionSealedPhase.constants";
 import { AUCTION_BID_PREMIUM_MULTIPLIER } from "../../shared/constants/premiums";
 
 const assertAuctionActiveScript = readFileSync(
@@ -14,6 +18,7 @@ const debitWalletIfSufficientScript = readFileSync(
   "utf8"
 );
 const placeAuctionBidScript = readFileSync(join(__dirname, "lua", "place_auction_bid.lua"), "utf8");
+const placeSealedAuctionBidScript = readFileSync(join(__dirname, "lua", "place_sealed_auction_bid.lua"), "utf8");
 
 let auctionRedis: Redis | null | undefined;
 
@@ -59,6 +64,84 @@ export function auctionViewerUsersKey(auctionId: string): string {
 
 export function auctionViewerCountKey(auctionId: string, userId: string): string {
   return `pullvault:auction:${auctionId.trim()}:viewer_count:${userId.trim()}`;
+}
+
+export function auctionSealedPhaseKey(auctionId: string): string {
+  return `pullvault:auction:${auctionId.trim()}:sealed_phase`;
+}
+
+export function auctionAntiSnipeExtensionsKey(auctionId: string): string {
+  return `pullvault:auction:${auctionId.trim()}:anti_snipe_extensions`;
+}
+
+export function auctionSealedBidsHashKey(auctionId: string): string {
+  return `pullvault:auction:${auctionId.trim()}:sealed_bids_usd`;
+}
+
+export function auctionSealedBidAtHashKey(auctionId: string): string {
+  return `pullvault:auction:${auctionId.trim()}:sealed_bid_at_ms`;
+}
+
+/** Reference USD from JustTCG (or DB fallback) at slot start; used for max bid = N× this value. */
+export function auctionListingJustTcgRefUsdKey(auctionListingId: string): string {
+  return `pullvault:auction:${auctionListingId.trim()}:justtcg_ref_usd`;
+}
+
+export async function getAuctionListingJustTcgRefUsd(auctionListingId: string): Promise<string | null> {
+  const redis = getAuctionRedis();
+  if (!redis) {
+    return null;
+  }
+  const v = await redis.get(auctionListingJustTcgRefUsdKey(auctionListingId));
+  return v != null && v !== "" ? v : null;
+}
+
+export async function isSealedPhaseActiveInRedis(auctionId: string): Promise<boolean> {
+  const redis = getAuctionRedis();
+  if (!redis) {
+    return false;
+  }
+  const v = await redis.get(auctionSealedPhaseKey(auctionId));
+  return v === "1";
+}
+
+export async function getUserSealedBidAmountFromRedis(
+  auctionId: string,
+  userId: string
+): Promise<string | null> {
+  const redis = getAuctionRedis();
+  if (!redis) {
+    return null;
+  }
+  const raw = await redis.hget(auctionSealedBidsHashKey(auctionId), userId.trim());
+  if (raw == null || raw === "") {
+    return null;
+  }
+  return raw;
+}
+
+export async function getSealedBidsFromRedis(
+  auctionId: string
+): Promise<Array<{ userId: string; amountUsd: string; atMs: number }>> {
+  const redis = getAuctionRedis();
+  if (!redis) {
+    return [];
+  }
+  const [amounts, ats] = await Promise.all([
+    redis.hgetall(auctionSealedBidsHashKey(auctionId)),
+    redis.hgetall(auctionSealedBidAtHashKey(auctionId))
+  ]);
+  const out: Array<{ userId: string; amountUsd: string; atMs: number }> = [];
+  for (const [userId, amountUsd] of Object.entries(amounts)) {
+    const uid = userId.trim();
+    if (!uid) {
+      continue;
+    }
+    const atRaw = ats[uid];
+    const atMs = atRaw != null && atRaw !== "" ? Number(atRaw) : 0;
+    out.push({ userId: uid, amountUsd, atMs: Number.isFinite(atMs) ? atMs : 0 });
+  }
+  return out;
 }
 
 export async function cacheAuctionEndTimeWithTtl(auctionId: string, endTimeIso: string): Promise<void> {
@@ -249,7 +332,7 @@ export async function placeAuctionBidInRedis(input: {
   extensionMs: number;
   requiredCoverageMultiplier?: number;
 }): Promise<
-  | { ok: true; acceptedBidUsd: string; bidderId: string; endTimeMs: number }
+  | { ok: true; acceptedBidUsd: string; bidderId: string; endTimeMs: number; sealedPhaseStarted: boolean }
   | {
       ok: false;
       reason:
@@ -261,7 +344,8 @@ export async function placeAuctionBidInRedis(input: {
         | "same_bidder"
         | "not_higher"
         | "wallet_missing"
-        | "insufficient";
+        | "insufficient"
+        | "sealed_phase_active";
     }
 > {
   const redis = getAuctionRedis();
@@ -271,11 +355,13 @@ export async function placeAuctionBidInRedis(input: {
 
   const raw = await redis.eval(
     placeAuctionBidScript,
-    4,
+    6,
     auctionEndTimeKey(input.auctionId),
     auctionHighestBidKey(input.auctionId),
     auctionHighestBidderKey(input.auctionId),
     auctionWalletKey(input.auctionId, input.bidderId),
+    auctionSealedPhaseKey(input.auctionId),
+    auctionAntiSnipeExtensionsKey(input.auctionId),
     String(Date.now()),
     input.bidderId,
     input.bidAmountUsd,
@@ -283,7 +369,9 @@ export async function placeAuctionBidInRedis(input: {
     String(Math.max(0, Math.floor(input.triggerWindowMs))),
     String(Math.max(0, Math.floor(input.extensionMs))),
     auctionWalletPrefix(input.auctionId),
-    String(input.requiredCoverageMultiplier ?? AUCTION_BID_PREMIUM_MULTIPLIER)
+    String(input.requiredCoverageMultiplier ?? AUCTION_BID_PREMIUM_MULTIPLIER),
+    String(AUCTION_ANTI_SNIPING_EXTENSIONS_BEFORE_SEALED),
+    String(AUCTION_SEALED_PHASE_MIN_DURATION_MS)
   );
 
   const tuple = Array.isArray(raw) ? raw : [raw];
@@ -296,6 +384,7 @@ export async function placeAuctionBidInRedis(input: {
     if (status === -6) return { ok: false, reason: "not_higher" };
     if (status === -7) return { ok: false, reason: "wallet_missing" };
     if (status === -8) return { ok: false, reason: "insufficient" };
+    if (status === -9) return { ok: false, reason: "sealed_phase_active" };
     return { ok: false, reason: "invalid" };
   }
 
@@ -303,7 +392,70 @@ export async function placeAuctionBidInRedis(input: {
     ok: true,
     acceptedBidUsd: String(tuple[1]),
     bidderId: String(tuple[2]),
-    endTimeMs: Number(tuple[3])
+    endTimeMs: Number(tuple[3]),
+    sealedPhaseStarted: String(tuple[5]) === "1"
+  };
+}
+
+export async function placeSealedAuctionBidInRedis(input: {
+  auctionId: string;
+  bidderId: string;
+  bidAmountUsd: string;
+  minAcceptedBidUsd: string;
+  requiredCoverageMultiplier?: number;
+}): Promise<
+  | { ok: true; endTimeMs: number; walletBalanceUsd: string }
+  | {
+      ok: false;
+      reason:
+        | "not_configured"
+        | "not_started"
+        | "ended"
+        | "invalid"
+        | "below_minimum"
+        | "wallet_missing"
+        | "insufficient"
+        | "sealed_phase_inactive"
+        | "already_submitted";
+    }
+> {
+  const redis = getAuctionRedis();
+  if (!redis) {
+    return { ok: false, reason: "not_configured" };
+  }
+
+  const raw = await redis.eval(
+    placeSealedAuctionBidScript,
+    5,
+    auctionEndTimeKey(input.auctionId),
+    auctionSealedPhaseKey(input.auctionId),
+    auctionWalletKey(input.auctionId, input.bidderId),
+    auctionSealedBidsHashKey(input.auctionId),
+    auctionSealedBidAtHashKey(input.auctionId),
+    String(Date.now()),
+    input.bidderId,
+    input.bidAmountUsd,
+    input.minAcceptedBidUsd,
+    String(input.requiredCoverageMultiplier ?? AUCTION_BID_PREMIUM_MULTIPLIER)
+  );
+
+  const tuple = Array.isArray(raw) ? raw : [raw];
+  const status = Number(tuple[0]);
+  if (status !== 1) {
+    if (status === -1) return { ok: false, reason: "not_started" };
+    if (status === -2) return { ok: false, reason: "ended" };
+    if (status === -4) return { ok: false, reason: "below_minimum" };
+    if (status === -7) return { ok: false, reason: "wallet_missing" };
+    if (status === -8) return { ok: false, reason: "insufficient" };
+    if (status === -10) return { ok: false, reason: "sealed_phase_inactive" };
+    if (status === -11) return { ok: false, reason: "already_submitted" };
+    return { ok: false, reason: "invalid" };
+  }
+
+  return {
+    ok: true,
+    endTimeMs: Number(tuple[1]),
+    walletBalanceUsd: String(tuple[2])
   };
 }
 
@@ -313,6 +465,27 @@ export async function publishAuctionBidUpdated(payload: AuctionBidBroadcastPaylo
     return;
   }
   await redis.publish(env.auctionBidBroadcastChannel, JSON.stringify(payload));
+}
+
+export async function publishAuctionSealedPhaseStarted(payload: {
+  auctionListingId: string;
+  endTime: string;
+  reason: "anti_snipe_threshold";
+}): Promise<void> {
+  const redis = getAuctionRedis();
+  if (!redis) {
+    return;
+  }
+  await redis.publish(
+    env.auctionBidBroadcastChannel,
+    JSON.stringify({
+      type: "auction_sealed_phase_started",
+      auctionListingId: payload.auctionListingId,
+      endTime: payload.endTime,
+      reason: payload.reason,
+      updatedAt: new Date().toISOString()
+    })
+  );
 }
 
 export async function markAuctionParticipant(auctionId: string, userId: string, ttlSeconds?: number): Promise<void> {

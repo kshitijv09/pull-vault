@@ -1,6 +1,5 @@
 import Redis from "ioredis";
 import Decimal from "decimal.js";
-import { query } from "../db";
 import { withTransaction } from "../db/transaction";
 import type { PoolClient } from "pg";
 import { env } from "../config/env";
@@ -11,13 +10,23 @@ import {
 import {
   creditCachedWalletBalance,
   debitCachedWalletBalanceIfSufficient,
-  getOrPrimeWalletBalance,
   setCachedWalletBalance,
   userWalletBalanceKey
 } from "../infra/redis/auctionWalletStore";
 import type { PackPurchaseQueuePayload } from "../modules/pack-queue/packQueue.types";
 import { recordCompanyEarning } from "../modules/analytics/earningsLedger.repository";
 import { AppError } from "../shared/errors/AppError";
+import { PACK_GENERATOR_CARDS_PER_PACK } from "../modules/pack-generator/packGenerator.config";
+import { PACK_INVENTORY_STATUS } from "../shared/constants/packInventoryStatus.constants";
+import {
+  PACK_FAIRNESS_DEFAULT_ALGORITHM_VERSION,
+  PACK_FAIRNESS_MODE,
+  type PackFairnessMode
+} from "../shared/constants/packFairnessCommit.constants";
+import {
+  PackFulfillmentStrategyRegistry,
+  type CatalogCardRow
+} from "./fulfillment";
 
 interface PackRow {
   inventory_id: string;
@@ -26,16 +35,8 @@ interface PackRow {
   price: string;
   cards_per_pack: number;
   inventory_status: string;
-}
-
-interface CatalogCardRow {
-  id: string;
-  card_id: string;
-  name: string;
-  card_set: string;
-  rarity: string;
-  market_value_usd: string;
-  image_url: string | null;
+  fairness_mode: string | null;
+  fairness_algorithm_version: string | null;
 }
 
 /**
@@ -86,6 +87,7 @@ function parsePayload(content: string): PackPurchaseQueuePayload {
   const tierId = assertNonEmptyString(parsed.tierId);
   const dropId = assertNonEmptyString(parsed.dropId);
   const packId = assertNonEmptyString(parsed.packId);
+  const nonce = assertNonEmptyString(parsed.nonce);
 
   if (!userId || !tierId || !dropId || !packId) {
     throw new AppError("Queue message missing required fields (userId, tierId, dropId, packId).", 400);
@@ -96,8 +98,19 @@ function parsePayload(content: string): PackPurchaseQueuePayload {
     tierId,
     dropId,
     packId,
-    requestedAt: assertNonEmptyString(parsed.requestedAt) || new Date().toISOString()
+    requestedAt: assertNonEmptyString(parsed.requestedAt) || new Date().toISOString(),
+    ...(nonce ? { nonce } : {})
   };
+}
+
+const fulfillmentStrategyRegistry = new PackFulfillmentStrategyRegistry();
+
+function resolveFairnessMode(value: string | null): PackFairnessMode {
+  return value === PACK_FAIRNESS_MODE.FAIRNESS
+    ? PACK_FAIRNESS_MODE.FAIRNESS
+    : value === PACK_FAIRNESS_MODE.LEGACY
+      ? PACK_FAIRNESS_MODE.LEGACY
+      : fulfillmentStrategyRegistry.defaultStrategyName;
 }
 
 let cachedInitialSellingStatus: string | null = null;
@@ -150,9 +163,12 @@ async function processPurchase(
           pi.drop_id,
           p.price::text AS price,
           p.cards_per_pack,
-          pi.status AS inventory_status
+          pi.status AS inventory_status,
+          d.fairness_mode,
+          d.fairness_algorithm_version
         FROM pack_inventory pi
         INNER JOIN packs p ON p.id = pi.pack_id
+        LEFT JOIN drops d ON d.id = pi.drop_id
         WHERE pi.id = $1::uuid
         FOR UPDATE OF pi, p
       `,
@@ -164,38 +180,27 @@ async function processPurchase(
     }
 
     const pack = packResult.rows[0];
-    const catalogCardsResult = await client.query<CatalogCardRow>(
-      `
-        SELECT
-          c.id,
-          c.card_id,
-          c.name,
-          c.card_set,
-          c.rarity,
-          c.market_value_usd::text AS market_value_usd,
-          c.image_url
-        FROM pack_card pc
-        INNER JOIN card c ON c.id = pc.card_id
-        WHERE pc.pack_id = $1::uuid
-        ORDER BY c.id
-      `,
-      [pack.pack_type_id]
-    );
 
-    const acquisitionPriceByCatalogCardId = await resolveAcquisitionPricesByCatalogCardId(
-      catalogCardsResult.rows
-    );
-    const totalCatalogCardValueUsd = catalogCardsResult.rows.reduce(
-      (sum, row) => sum.plus(new Decimal(row.market_value_usd)),
-      new Decimal(0)
-    );
+    if (pack.cards_per_pack !== PACK_GENERATOR_CARDS_PER_PACK) {
+      throw new AppError(
+        `Pack template ${pack.pack_type_id} has cards_per_pack=${pack.cards_per_pack}; expected ${PACK_GENERATOR_CARDS_PER_PACK} from pack-generator.`,
+        500
+      );
+    }
 
     if (pack.drop_id !== payload.dropId) {
       throw new AppError("dropId does not match the pack tier.", 400);
     }
-    if (pack.inventory_status !== "available") {
-      throw new AppError("Pack inventory is not available.", 409);
+    if (pack.inventory_status !== PACK_INVENTORY_STATUS.IN_DROP_SALE) {
+      throw new AppError(
+        `Pack inventory is not available for purchase (status=${pack.inventory_status}, expected ${PACK_INVENTORY_STATUS.IN_DROP_SALE}).`,
+        409
+      );
     }
+
+    const fairnessMode = resolveFairnessMode(pack.fairness_mode);
+    const fairnessAlgorithmVersion =
+      pack.fairness_algorithm_version?.trim() || PACK_FAIRNESS_DEFAULT_ALGORITHM_VERSION;
 
     const walletResult = await client.query<{
         id: string;
@@ -251,10 +256,10 @@ async function processPurchase(
     await client.query(
       `
         UPDATE pack_inventory
-        SET status = 'sold'
+        SET status = $2
         WHERE id = $1::uuid
       `,
-      [pack.inventory_id]
+      [pack.inventory_id, PACK_INVENTORY_STATUS.OWNED]
     );
 
     const userPackResult = await client.query<{ id: string }>(
@@ -279,7 +284,7 @@ async function processPurchase(
         pack.cards_per_pack,
         packPriceUsd,
         queueMessageId,
-        JSON.stringify({ requestedAt: payload.requestedAt })
+        JSON.stringify({ requestedAt: payload.requestedAt, fairnessMode })
       ]
     );
 
@@ -288,9 +293,40 @@ async function processPurchase(
       throw new AppError("Failed to assign purchased pack to user.", 500);
     }
 
+    const fulfillmentStrategy = fulfillmentStrategyRegistry.resolve(fairnessMode);
+    const fulfillment = await fulfillmentStrategy.fulfill({
+      client,
+      userId: payload.userId,
+      dropId: payload.dropId,
+      pack: {
+        inventoryId: pack.inventory_id,
+        packTypeId: pack.pack_type_id,
+        packPriceUsd: packPrice,
+        cardsPerPack: pack.cards_per_pack,
+        fairnessMode,
+        fairnessAlgorithmVersion
+      },
+      userPackId,
+      ...(payload.nonce ? { nonce: payload.nonce } : {})
+    });
+
+    const fulfilledCards = fulfillment.cards;
+    if (fulfilledCards.length !== pack.cards_per_pack) {
+      throw new AppError(
+        `Fulfillment strategy '${fulfillmentStrategy.name}' returned ${fulfilledCards.length} cards; expected ${pack.cards_per_pack}.`,
+        500
+      );
+    }
+
+    const acquisitionPriceByCatalogCardId = await resolveAcquisitionPricesByCatalogCardId(fulfilledCards);
+    const totalCatalogCardValueUsd = fulfilledCards.reduce(
+      (sum, row) => sum.plus(new Decimal(row.market_value_usd)),
+      new Decimal(0)
+    );
+
     const initialSellingStatus = await resolveInitialSellingStatus(client);
     let insertedUserCards = 0;
-    for (const row of catalogCardsResult.rows) {
+    for (const row of fulfilledCards) {
       const acquisitionPrice =
         acquisitionPriceByCatalogCardId.get(row.id) ?? new Decimal(row.market_value_usd).toDecimalPlaces(2).toFixed(2);
       await client.query(
@@ -314,7 +350,9 @@ async function processPurchase(
         dropId: payload.dropId,
         tierId: payload.tierId,
         packPriceUsd: packPrice.toDecimalPlaces(2).toFixed(2),
-        totalCardValueUsd: totalCatalogCardValueUsd.toDecimalPlaces(2).toFixed(2)
+        totalCardValueUsd: totalCatalogCardValueUsd.toDecimalPlaces(2).toFixed(2),
+        fairnessMode,
+        fulfillmentStrategy: fulfillmentStrategy.name
       }
     });
 
@@ -322,7 +360,7 @@ async function processPurchase(
       userPackId,
       userCardCount: insertedUserCards,
       buyerWalletBalanceUsd: debitResult.newBalanceUsd,
-      purchasedCards: catalogCardsResult.rows
+      purchasedCards: fulfilledCards
         .map((row) => ({
           cardId: row.card_id,
           name: row.name,

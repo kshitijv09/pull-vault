@@ -18,3 +18,5 @@ auctionRouter.post("/:auctionId/start", authMiddleware, controller.startAuction)
 auctionRouter.post("/:auctionId/bids/init", authMiddleware, controller.initBidSession);
 auctionRouter.post("/:auctionId/bids/restore", authMiddleware, controller.restoreOutbidWallet);
 auctionRouter.post("/:auctionId/bids", authMiddleware, controller.placeBid);
+auctionRouter.post("/:auctionId/bids/sealed", authMiddleware, controller.placeSealedBid);
+auctionRouter.post("/:auctionId/fraud-review", authMiddleware, controller.evaluateAuctionFraudReview);

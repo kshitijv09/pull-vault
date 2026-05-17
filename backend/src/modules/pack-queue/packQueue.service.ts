@@ -5,6 +5,10 @@ import { UserRepository } from "../user/user.repository";
 import { query } from "../../db";
 import { getOrderedPackIdsForTier } from "./packInventoryCapStore";
 import { getOrPrimeWalletBalance, userWalletBalanceKey } from "../../infra/redis/auctionWalletStore";
+import {
+  PACK_FAIRNESS_MODE,
+  type PackFairnessMode
+} from "../../shared/constants/packFairnessCommit.constants";
 import type { PackPurchaseQueuePayload, QueuePackPurchaseAccepted, QueuePackPurchaseBody } from "./packQueue.types";
 
 function assertNonEmpty(field: string, value: unknown): string {
@@ -54,7 +58,17 @@ export class PackQueueService {
       });
     }
 
-    const tierPriceUsd = await this.getTierPriceUsd(parsed.dropId, parsed.tierId);
+    const tierContext = await this.getTierContext(parsed.dropId, parsed.tierId);
+    if (tierContext.fairnessMode === PACK_FAIRNESS_MODE.FAIRNESS && !parsed.nonce) {
+      throw new AppError(
+        "Fairness session nonce is required for this drop. Call /drops/:dropId/fairness-commit first.",
+        400
+      );
+    }
+    if (parsed.nonce) {
+      await this.assertFairnessCommitUsable(parsed.nonce, parsed.dropId, userId);
+    }
+    const tierPriceUsd = tierContext.priceUsd;
     const cachedWalletBalanceUsd = await this.ensureSharedWalletCached(userId);
 
     const reserve = await this.packCounter.tryReserveFromTierAvailableList(
@@ -125,9 +139,18 @@ export class PackQueueService {
     }
 
     const record = body as Record<string, unknown>;
+    const rawNonce = record.nonce;
+    let nonce: string | undefined;
+    if (typeof rawNonce === "string" && rawNonce.trim().length > 0) {
+      nonce = rawNonce.trim();
+    } else if (rawNonce !== undefined && rawNonce !== null && rawNonce !== "") {
+      throw new AppError("nonce must be a non-empty string when provided.", 400);
+    }
+
     return {
       dropId: assertNonEmpty("dropId", record.dropId),
-      tierId: assertNonEmpty("tierId", record.tierId)
+      tierId: assertNonEmpty("tierId", record.tierId),
+      ...(nonce ? { nonce } : {})
     };
   }
 
@@ -150,12 +173,18 @@ export class PackQueueService {
     return wallet.balanceUsd;
   }
 
-  private async getTierPriceUsd(dropId: string, tierId: string): Promise<string> {
-    const result = await query<{ price_usd: string }>(
+  private async getTierContext(
+    dropId: string,
+    tierId: string
+  ): Promise<{ priceUsd: string; fairnessMode: PackFairnessMode }> {
+    const result = await query<{ price_usd: string; fairness_mode: string }>(
       `
-        SELECT p.price::text AS price_usd
+        SELECT
+          p.price::text AS price_usd,
+          COALESCE(d.fairness_mode, 'legacy') AS fairness_mode
         FROM pack_inventory pi
         INNER JOIN packs p ON p.id = pi.pack_id
+        LEFT JOIN drops d ON d.id = pi.drop_id
         WHERE pi.drop_id = $1::uuid
           AND lower(p.tier_name) = lower($2)
         LIMIT 1
@@ -166,6 +195,34 @@ export class PackQueueService {
     if (!row?.price_usd) {
       throw new AppError("Unknown tier for this drop or no packs in inventory.", 404);
     }
-    return row.price_usd;
+    const mode =
+      row.fairness_mode === PACK_FAIRNESS_MODE.FAIRNESS
+        ? PACK_FAIRNESS_MODE.FAIRNESS
+        : PACK_FAIRNESS_MODE.LEGACY;
+    return { priceUsd: row.price_usd, fairnessMode: mode };
+  }
+
+  private async assertFairnessCommitUsable(nonce: string, dropId: string, userId: string): Promise<void> {
+    const result = await query<{ id: string; consumed_at: string | null }>(
+      `
+        SELECT id, consumed_at
+        FROM pack_fairness_commit
+        WHERE id = $1::uuid
+          AND user_id = $2::uuid
+          AND drop_id = $3::uuid
+        LIMIT 1
+      `,
+      [nonce, userId, dropId]
+    );
+    const row = result.rows[0];
+    if (!row) {
+      throw new AppError(
+        "Fairness session not found for this drop. Call /drops/:dropId/fairness-commit first.",
+        404
+      );
+    }
+    if (row.consumed_at) {
+      throw new AppError("Fairness session has already been consumed by a previous purchase.", 409);
+    }
   }
 }

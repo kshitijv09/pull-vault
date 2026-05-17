@@ -178,6 +178,19 @@ function CollectionCardActionMenu({
           >
             {pending && canUnlist ? "Updating…" : "Unlist from sale"}
           </button>
+          {card.userPackId ? (
+            <Link
+              role="menuitem"
+              href={`/verify/${card.userPackId}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onClose();
+              }}
+              className="flex w-full border-t border-white/5 px-3 py-2.5 text-left text-sm text-emerald-200 transition hover:bg-white/10"
+            >
+              Verify fairness…
+            </Link>
+          ) : null}
         </div>
       ) : null}
     </div>

@@ -2,7 +2,15 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { ApiRequestError, apiGetJson, apiPostJson, getPackAvailabilityWsUrl } from "@/lib/api";
+import { ShieldCheck } from "lucide-react";
+import {
+  ApiRequestError,
+  apiGetJson,
+  apiPostJson,
+  commitPackFairness,
+  getPackAvailabilityWsUrl,
+  type PackFairnessCommitResponse
+} from "@/lib/api";
 import { useAuth } from "@/context/auth-context";
 import PackOpener from "./PackOpener";
 
@@ -12,6 +20,8 @@ interface Drop {
   status: string;
   startTime: string;
   durationMinutes: number;
+  /** New since provably-fair B4: server returns "fairness" or "legacy". Defaults to "fairness". */
+  fairnessMode?: "fairness" | "legacy";
   packs?: Pack[];
 }
 
@@ -117,6 +127,7 @@ export default function DropSalePage() {
   const [isDropLive, setIsDropLive] = useState(false);
   const [loading, setLoading] = useState(true);
   const [selectedDropId, setSelectedDropId] = useState<string | null>(null);
+  const [fairnessMode, setFairnessMode] = useState<"fairness" | "legacy">("fairness");
   const [packs, setPacks] = useState<Pack[]>([]);
   const [availabilityByTier, setAvailabilityByTier] = useState<Record<string, number>>({});
   const [purchasePendingTier, setPurchasePendingTier] = useState<string | null>(null);
@@ -124,6 +135,11 @@ export default function DropSalePage() {
   const [purchaseFlash, setPurchaseFlash] = useState<string | null>(null);
   const [purchaseError, setPurchaseError] = useState<string | null>(null);
   const [purchaseDetails, setPurchaseDetails] = useState<PackPurchaseSuccessEvent | null>(null);
+  /** Phase 1 commit pre-pinned to the confirmation modal session; null until the user opens the modal on a fairness drop. */
+  const [fairnessCommit, setFairnessCommit] = useState<PackFairnessCommitResponse | null>(null);
+  const [fairnessCommitPending, setFairnessCommitPending] = useState(false);
+  const [fairnessCommitError, setFairnessCommitError] = useState<string | null>(null);
+  const [clientSeedInput, setClientSeedInput] = useState("");
   const [timeLeft, setTimeLeft] = useState({
     days: 0,
     hours: 0,
@@ -148,6 +164,7 @@ export default function DropSalePage() {
         const dropStartTimeMs = Date.parse(targetDrop.startTime);
         setDropName(targetDrop.name || "Upcoming Drop");
         setSelectedDropId(targetDrop.id);
+        setFairnessMode(targetDrop.fairnessMode === "legacy" ? "legacy" : "fairness");
         setPacks(Array.isArray(targetDrop.packs) ? targetDrop.packs : []);
         setAvailabilityByTier({});
 
@@ -289,30 +306,92 @@ export default function DropSalePage() {
     }))
     .sort((a, b) => a.tierName.localeCompare(b.tierName));
 
+  /**
+   * Phase 1 of provably-fair: lock a `nonce` + `server_commitment` BEFORE the
+   * purchase POST so the eventual draw is bound to a commitment the user has
+   * already seen. Legacy drops skip this; `pack-queue/purchases` simply doesn't
+   * receive a `nonce` in that case.
+   */
   const handleBuyPack = async (tierName: string) => {
     if (!selectedDropId || !token) return;
+    if (fairnessMode === "fairness" && !fairnessCommit) {
+      setPurchaseError("Generate a fairness session before confirming the purchase.");
+      return;
+    }
     setPurchasePendingTier(tierName);
     setPurchaseFlash(null);
     setPurchaseError(null);
     setPurchaseDetails(null);
     try {
-      await apiPostJson<{ status: "queued"; message: string }>("/pack-queue/purchases", {
+      const body: Record<string, unknown> = {
         dropId: selectedDropId,
         tierId: tierName
-      });
+      };
+      if (fairnessMode === "fairness" && fairnessCommit) {
+        body.nonce = fairnessCommit.nonce;
+      }
+      await apiPostJson<{ status: "queued"; message: string }>("/pack-queue/purchases", body);
       setPurchaseFlash(`Purchase queued for ${tierName} pack.`);
     } catch (e) {
       setPurchaseError(e instanceof ApiRequestError ? e.message : "Could not queue purchase.");
     } finally {
       setPurchasePendingTier(null);
       setConfirmTier(null);
+      setFairnessCommit(null);
+      setFairnessCommitError(null);
+      setClientSeedInput("");
     }
   };
-  const openPurchaseConfirmation = (tierName: string) => {
+
+  const openPurchaseConfirmation = async (tierName: string) => {
     if (purchasePendingTier) return;
     setPurchaseFlash(null);
     setPurchaseError(null);
     setConfirmTier(tierName);
+    setFairnessCommit(null);
+    setFairnessCommitError(null);
+    setClientSeedInput("");
+
+    if (fairnessMode === "fairness" && selectedDropId && token) {
+      setFairnessCommitPending(true);
+      try {
+        const commit = await commitPackFairness(selectedDropId);
+        setFairnessCommit(commit);
+      } catch (e) {
+        setFairnessCommitError(
+          e instanceof ApiRequestError
+            ? e.message
+            : "Could not generate a fairness session. Try again."
+        );
+      } finally {
+        setFairnessCommitPending(false);
+      }
+    }
+  };
+
+  const regenerateFairnessCommit = async () => {
+    if (!selectedDropId || !token) return;
+    setFairnessCommitError(null);
+    setFairnessCommitPending(true);
+    try {
+      const commit = await commitPackFairness(selectedDropId, clientSeedInput);
+      setFairnessCommit(commit);
+    } catch (e) {
+      setFairnessCommitError(
+        e instanceof ApiRequestError
+          ? e.message
+          : "Could not generate a fairness session. Try again."
+      );
+    } finally {
+      setFairnessCommitPending(false);
+    }
+  };
+
+  const closeConfirmation = () => {
+    setConfirmTier(null);
+    setFairnessCommit(null);
+    setFairnessCommitError(null);
+    setClientSeedInput("");
   };
 
   return (
@@ -365,6 +444,7 @@ export default function DropSalePage() {
            <PackOpener 
              cards={purchaseDetails.cards} 
              tierId={purchaseDetails.tierId} 
+             userPackId={purchaseDetails.userPackId}
              onClose={() => setPurchaseDetails(null)} 
            />
         ) : null}
@@ -446,7 +526,7 @@ export default function DropSalePage() {
                       <button
                         type="button"
                         disabled={disabled}
-                        onClick={() => openPurchaseConfirmation(tier.tierName)}
+                        onClick={() => void openPurchaseConfirmation(tier.tierName)}
                         className={`mt-6 w-full rounded-2xl py-3.5 text-sm font-bold tracking-wide text-slate-950 transition-all duration-300 disabled:cursor-not-allowed disabled:opacity-30 
                           ${soldOut ? "bg-slate-700 text-slate-400" : "bg-white hover:bg-slate-100 hover:scale-[1.02] active:scale-[0.98] shadow-lg shadow-black/20"}`}
                       >
@@ -478,23 +558,102 @@ export default function DropSalePage() {
       </div>
       {confirmTier ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 px-4">
-          <div className="w-full max-w-md rounded-2xl border border-white/10 bg-[#0f172a] p-5 shadow-2xl">
+          <div className="w-full max-w-lg rounded-2xl border border-white/10 bg-[#0f172a] p-5 shadow-2xl">
             <h3 className="text-base font-semibold text-white">Confirm Purchase</h3>
             <p className="mt-2 text-sm text-slate-300">
-              Are you sure you want to queue a purchase for the <span className="font-semibold text-white">{confirmTier}</span> tier?
+              Queue a purchase for the <span className="font-semibold text-white">{confirmTier}</span> tier?
             </p>
-            <div className="mt-4 flex items-center justify-end gap-2">
+
+            {fairnessMode === "fairness" ? (
+              <div className="mt-4 rounded-xl border border-emerald-500/20 bg-emerald-500/[0.04] p-4 text-left">
+                <div className="flex items-center gap-2 text-emerald-300">
+                  <ShieldCheck className="h-4 w-4" />
+                  <span className="text-xs font-semibold uppercase tracking-wide">
+                    Provably-fair session
+                  </span>
+                </div>
+                <p className="mt-2 text-xs leading-relaxed text-slate-300">
+                  The server locks its <code className="rounded bg-black/30 px-1 py-0.5">server_commitment</code>{" "}
+                  before you buy. Your <code className="rounded bg-black/30 px-1 py-0.5">client_seed</code>{" "}
+                  also feeds the draw so the platform cannot pick outcomes using only its own
+                  secret. After the pack opens you can replay the derivation in your browser on
+                  the <span className="font-mono">/verify</span> page.
+                </p>
+
+                <label className="mt-3 block text-xs font-medium text-slate-300">
+                  Client seed
+                  <span className="ml-1 text-slate-500">(optional — server generates one if blank)</span>
+                </label>
+                <div className="mt-1 flex items-center gap-2">
+                  <input
+                    type="text"
+                    maxLength={512}
+                    placeholder="Anything you want — e.g. a memorable phrase"
+                    value={clientSeedInput}
+                    onChange={(e) => setClientSeedInput(e.target.value)}
+                    disabled={fairnessCommitPending || purchasePendingTier === confirmTier}
+                    className="flex-1 rounded-lg border border-white/10 bg-slate-950/60 px-3 py-2 text-sm text-white placeholder-slate-500 outline-none focus:border-emerald-500/40 disabled:cursor-not-allowed disabled:opacity-50"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void regenerateFairnessCommit()}
+                    disabled={fairnessCommitPending || purchasePendingTier === confirmTier}
+                    className="rounded-lg border border-white/10 px-3 py-2 text-xs font-medium text-slate-200 hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {fairnessCommitPending ? "…" : "Apply"}
+                  </button>
+                </div>
+
+                {fairnessCommitError ? (
+                  <p className="mt-2 text-xs text-rose-300">{fairnessCommitError}</p>
+                ) : null}
+
+                {fairnessCommit ? (
+                  <dl className="mt-3 space-y-1.5 text-[11px] text-slate-400">
+                    <div>
+                      <dt className="inline text-slate-500">Fairness session ID: </dt>
+                      <dd className="inline break-all font-mono text-slate-200">
+                        {fairnessCommit.nonce}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="inline text-slate-500">Server commitment: </dt>
+                      <dd className="inline break-all font-mono text-slate-200">
+                        {fairnessCommit.server_commitment}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="inline text-slate-500">Client seed used: </dt>
+                      <dd className="inline break-all font-mono text-slate-200">
+                        {fairnessCommit.client_seed}
+                      </dd>
+                      <span className="ml-1 rounded bg-white/5 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-400">
+                        {fairnessCommit.client_seed_source}
+                      </span>
+                    </div>
+                  </dl>
+                ) : fairnessCommitPending ? (
+                  <p className="mt-3 text-xs text-slate-400">Locking server commitment…</p>
+                ) : null}
+              </div>
+            ) : null}
+
+            <div className="mt-5 flex items-center justify-end gap-2">
               <button
                 type="button"
                 disabled={purchasePendingTier === confirmTier}
-                onClick={() => setConfirmTier(null)}
+                onClick={closeConfirmation}
                 className="rounded-lg border border-white/15 px-3 py-2 text-sm font-medium text-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 type="button"
-                disabled={purchasePendingTier === confirmTier}
+                disabled={
+                  purchasePendingTier === confirmTier ||
+                  fairnessCommitPending ||
+                  (fairnessMode === "fairness" && !fairnessCommit)
+                }
                 onClick={() => void handleBuyPack(confirmTier)}
                 className="rounded-lg bg-accent px-3 py-2 text-sm font-semibold text-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
               >

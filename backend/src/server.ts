@@ -17,6 +17,8 @@ import { startInventoryCardPriceRefreshJob } from "./jobs/inventoryCardPriceRefr
 import { startDropSaleLifecycleScheduler } from "./jobs/dropSaleLifecycleScheduler";
 import { startAuctionSlotLifecycleScheduler } from "./jobs/auctionSlotLifecycleScheduler";
 import { startUserPortfolioSnapshotJob } from "./jobs/userPortfolioSnapshotJob";
+import dns from "dns";
+dns.setDefaultResultOrder("ipv4first");
 
 async function start(): Promise<void> {
   await prefetchPackInventoryCaps(); // Fetch and load in-memory so that requests can be served faster. Data is there in redis as well

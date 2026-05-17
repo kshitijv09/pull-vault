@@ -1,4 +1,5 @@
 import { query } from "../../db";
+import { PACK_INVENTORY_STATUS } from "../../shared/constants/packInventoryStatus.constants";
 import type { PackRemainingSeedRow, TierQueueSeed } from "../../infra/redis/shardedRedisPackCounter";
 
 interface PackRow {
@@ -29,7 +30,7 @@ export async function prefetchPackInventoryCaps(): Promise<void> {
       FROM pack_inventory pi
       INNER JOIN packs p ON p.id = pi.pack_id
       WHERE pi.drop_id IS NOT NULL
-        AND pi.status = 'available'
+        AND pi.status = '${PACK_INVENTORY_STATUS.IN_DROP_SALE}'
       ORDER BY pi.drop_id, p.tier_name, pi.created_at, pi.id
     `
   );

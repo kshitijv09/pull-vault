@@ -29,11 +29,25 @@ FROM packs p
 ON CONFLICT (id) DO NOTHING;
 
 -- Seed available individual inventory rows from current available_count.
-INSERT INTO pack_inventory (pack_id, drop_id, status)
-SELECT p.id, p.drop_id, 'available'
-FROM packs p
-CROSS JOIN LATERAL generate_series(1, GREATEST(p.available_count, 0))
-ON CONFLICT DO NOTHING;
+-- Wrapped in a DO block: on re-runs after migration 031 has applied, the
+-- constraint no longer allows 'available', so skip seeding to stay idempotent.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint c
+    JOIN pg_class t ON t.oid = c.conrelid
+    WHERE t.relname = 'pack_inventory'
+      AND c.conname = 'pack_inventory_status_check'
+      AND pg_get_constraintdef(c.oid) LIKE '%available%'
+  ) THEN
+    INSERT INTO pack_inventory (pack_id, drop_id, status)
+    SELECT p.id, p.drop_id, 'available'
+    FROM packs p
+    CROSS JOIN LATERAL generate_series(1, GREATEST(p.available_count, 0))
+    ON CONFLICT DO NOTHING;
+  END IF;
+END;
+$$;
 
 -- Switch user_packs.pack_id FK from pack type to pack inventory row.
 ALTER TABLE user_packs

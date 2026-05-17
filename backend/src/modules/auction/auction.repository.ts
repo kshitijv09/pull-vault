@@ -84,6 +84,7 @@ export class AuctionRepository {
       card_set: string | null;
       card_rarity: string | null;
       card_image_url: string | null;
+      needs_fraud_review: boolean | null;
     }>(
       `
         SELECT
@@ -97,6 +98,7 @@ export class AuctionRepository {
           al.current_high_bidder_id,
           al.end_time,
           al.status,
+          al.needs_fraud_review,
           s.status AS slot_status,
           s.start_time AS slot_start_time,
           c.name AS card_name,
@@ -133,7 +135,8 @@ export class AuctionRepository {
       cardName: r.card_name,
       cardSet: r.card_set,
       cardRarity: r.card_rarity,
-      cardImageUrl: r.card_image_url
+      cardImageUrl: r.card_image_url,
+      needsFraudReview: r.needs_fraud_review
     }));
   }
 
@@ -465,30 +468,36 @@ export class AuctionRepository {
   async getAuctionListingById(auctionListingId: string): Promise<{
     id: string;
     sellerId: string;
+    userCardId: string;
     startBidUsd: string;
     highestBidUsd: string | null;
     highestBidderId: string | null;
     endTime: string;
     status: AuctionListingStatus;
+    sealedPhaseActive: boolean;
   } | null> {
     const res = await query<{
       id: string;
       seller_id: string;
+      card_id: string;
       start_bid: string;
       current_high_bid: string | null;
       current_high_bidder_id: string | null;
       end_time: Date;
       status: AuctionListingStatus;
+      sealed_phase_active: boolean;
     }>(
       `
         SELECT
           auction_listings.id,
           auction_listings.seller_id,
+          auction_listings.card_id,
           auction_listings.start_bid::text AS start_bid,
           auction_listings.current_high_bid::text AS current_high_bid,
           auction_listings.current_high_bidder_id,
           auction_listings.end_time,
-          auction_listings.status
+          auction_listings.status,
+          auction_listings.sealed_phase_active
         FROM auction_listings
         WHERE id = $1::uuid
       `,
@@ -501,12 +510,54 @@ export class AuctionRepository {
     return {
       id: row.id,
       sellerId: row.seller_id,
+      userCardId: row.card_id,
       startBidUsd: row.start_bid,
       highestBidUsd: row.current_high_bid,
       highestBidderId: row.current_high_bidder_id,
       endTime: row.end_time.toISOString(),
-      status: row.status
+      status: row.status,
+      sealedPhaseActive: row.sealed_phase_active
     };
+  }
+
+  /**
+   * Async persistence from bid handlers — does not participate in the listing transaction.
+   */
+  async insertAuctionCardBid(input: {
+    auctionListingId: string;
+    userCardId: string;
+    bidderId: string;
+    bidAmountUsd: string;
+    bidKind: "open" | "sealed";
+    listingEndTimeAfterBidIso: string;
+    antiSnipingExtensionApplied: boolean;
+    sealedPhaseStartedThisBid: boolean;
+  }): Promise<void> {
+    await query(
+      `
+        INSERT INTO auction_card_bids (
+          auction_listing_id,
+          user_card_id,
+          bidder_id,
+          bid_amount,
+          bid_kind,
+          listing_end_time_after_bid,
+          anti_sniping_extension_applied,
+          sealed_phase_started_this_bid
+        )
+        VALUES ($1::uuid, $2::uuid, $3::uuid, $4::numeric, $5, $6::timestamptz, $7, $8)
+      `,
+      [
+        input.auctionListingId,
+        input.userCardId,
+        input.bidderId,
+        input.bidAmountUsd,
+        input.bidKind,
+        input.listingEndTimeAfterBidIso,
+        input.antiSnipingExtensionApplied,
+        input.sealedPhaseStartedThisBid
+      ]
+    );
   }
 
   async listLiveListingsPastEndTime(limit = 100): Promise<string[]> {
@@ -514,7 +565,7 @@ export class AuctionRepository {
       `
         SELECT id
         FROM auction_listings
-        WHERE status = 'live'
+        WHERE status IN ('live', 'pending')
           AND end_time <= NOW()
         ORDER BY end_time ASC
         LIMIT $1::int
@@ -522,6 +573,37 @@ export class AuctionRepository {
       [limit]
     );
     return res.rows.map((r) => r.id);
+  }
+
+  /** External JustTCG `card_id` + catalog market value for auction listings (for bid ceiling). */
+  async listCatalogReferenceForAuctionListings(
+    listingIds: string[]
+  ): Promise<Array<{ listingId: string; externalCardId: string; marketValueUsd: string }>> {
+    if (listingIds.length === 0) {
+      return [];
+    }
+    const res = await query<{
+      listing_id: string;
+      external_card_id: string;
+      market_value_usd: string;
+    }>(
+      `
+        SELECT
+          al.id AS listing_id,
+          TRIM(c.card_id) AS external_card_id,
+          c.market_value_usd::text AS market_value_usd
+        FROM auction_listings al
+        INNER JOIN user_cards uc ON uc.id = al.card_id
+        INNER JOIN card c ON c.id = uc.card_id
+        WHERE al.id = ANY($1::uuid[])
+      `,
+      [listingIds]
+    );
+    return res.rows.map((r) => ({
+      listingId: r.listing_id,
+      externalCardId: r.external_card_id.trim(),
+      marketValueUsd: r.market_value_usd
+    }));
   }
 
   async findSlotsReadyToStart(atIso: string): Promise<string[]> {
@@ -600,8 +682,22 @@ export class AuctionRepository {
     input: {
       auctionListingId: string;
       endTimeIso: string;
+      sealedPhaseActive?: boolean;
     }
   ): Promise<void> {
+    if (input.sealedPhaseActive === true) {
+      await client.query(
+        `
+          UPDATE auction_listings
+          SET
+            end_time = $1::timestamptz,
+            sealed_phase_active = TRUE
+          WHERE id = $2::uuid
+        `,
+        [input.endTimeIso, input.auctionListingId]
+      );
+      return;
+    }
     await client.query(
       `
         UPDATE auction_listings
@@ -611,6 +707,69 @@ export class AuctionRepository {
       `,
       [input.endTimeIso, input.auctionListingId]
     );
+  }
+
+  async upsertSealedBidRecord(
+    client: PoolClient,
+    input: { auctionListingId: string; bidderId: string; amountCiphertext: string }
+  ): Promise<void> {
+    await client.query(
+      `
+        INSERT INTO auction_sealed_bid_records (auction_listing_id, bidder_id, amount_ciphertext, updated_at)
+        VALUES ($1::uuid, $2::uuid, $3, NOW())
+        ON CONFLICT (auction_listing_id, bidder_id)
+        DO UPDATE SET
+          amount_ciphertext = EXCLUDED.amount_ciphertext,
+          updated_at = NOW()
+      `,
+      [input.auctionListingId, input.bidderId, input.amountCiphertext]
+    );
+  }
+
+  async hasUserSealedBidRecord(auctionListingId: string, bidderId: string): Promise<boolean> {
+    const res = await query<{ exists: number }>(
+      `
+        SELECT 1 AS exists
+        FROM auction_sealed_bid_records
+        WHERE auction_listing_id = $1::uuid
+          AND bidder_id = $2::uuid
+        LIMIT 1
+      `,
+      [auctionListingId, bidderId]
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  async listSealedBidCiphertextRows(auctionListingId: string): Promise<Array<{ bidderId: string; ciphertext: string }>> {
+    const res = await query<{ bidder_id: string; amount_ciphertext: string }>(
+      `
+        SELECT bidder_id, amount_ciphertext
+        FROM auction_sealed_bid_records
+        WHERE auction_listing_id = $1::uuid
+      `,
+      [auctionListingId]
+    );
+    return res.rows.map((r) => ({ bidderId: r.bidder_id, ciphertext: r.amount_ciphertext }));
+  }
+
+  async getLatestOpenBidHistoryTimestamp(
+    client: PoolClient,
+    auctionListingId: string
+  ): Promise<number | null> {
+    const res = await client.query<{ bid_at: Date }>(
+      `
+        SELECT bid_at
+        FROM auction_bid_history
+        WHERE auction_listing_id = $1::uuid
+        ORDER BY bid_at DESC
+        LIMIT 1
+      `,
+      [auctionListingId]
+    );
+    if (res.rows.length === 0) {
+      return null;
+    }
+    return res.rows[0].bid_at.getTime();
   }
 
   async insertBidHistory(
@@ -804,21 +963,33 @@ export class AuctionRepository {
     );
   }
 
-  async clearSellerAuctionStatusForCard(
+  /**
+   * After an unsold auction listing: card stays with the seller and returns to collection as unlisted.
+   */
+  async restoreUnsoldCardToSeller(
     client: PoolClient,
     sellerId: string,
     userCardId: string
-  ): Promise<void> {
-    await client.query(
+  ): Promise<boolean> {
+    const res = await client.query(
       `
         UPDATE user_cards
         SET selling_status = 'unlisted'
         WHERE user_id = $1::uuid
           AND id = $2::uuid
-          AND selling_status = 'listed_for_auction'
       `,
       [sellerId, userCardId]
     );
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  /** @deprecated Use restoreUnsoldCardToSeller */
+  async clearSellerAuctionStatusForCard(
+    client: PoolClient,
+    sellerId: string,
+    userCardId: string
+  ): Promise<void> {
+    await this.restoreUnsoldCardToSeller(client, sellerId, userCardId);
   }
 
   async completeSlotIfNoLiveListings(client: PoolClient, slotId: string): Promise<void> {
@@ -835,5 +1006,182 @@ export class AuctionRepository {
     if (remaining === 0) {
       await client.query(`UPDATE auction_slots SET status = 'completed' WHERE id = $1::uuid`, [slotId]);
     }
+  }
+
+  async getListingForFraudReview(auctionListingId: string): Promise<{
+    id: string;
+    sellerId: string;
+    currentHighBidderId: string | null;
+    currentHighBidUsd: string | null;
+    status: AuctionListingStatus;
+    marketValueUsd: string;
+  } | null> {
+    const res = await query<{
+      id: string;
+      seller_id: string;
+      current_high_bidder_id: string | null;
+      current_high_bid: string | null;
+      status: AuctionListingStatus;
+      market_value_usd: string;
+    }>(
+      `
+        SELECT
+          al.id,
+          al.seller_id,
+          al.current_high_bidder_id,
+          al.current_high_bid::text AS current_high_bid,
+          al.status,
+          c.market_value_usd::text AS market_value_usd
+        FROM auction_listings al
+        INNER JOIN user_cards uc ON uc.id = al.card_id
+        INNER JOIN card c ON c.id = uc.card_id
+        WHERE al.id = $1::uuid
+      `,
+      [auctionListingId]
+    );
+    if (res.rows.length === 0) {
+      return null;
+    }
+    const r = res.rows[0];
+    return {
+      id: r.id,
+      sellerId: r.seller_id,
+      currentHighBidderId: r.current_high_bidder_id,
+      currentHighBidUsd: r.current_high_bid,
+      status: r.status,
+      marketValueUsd: r.market_value_usd
+    };
+  }
+
+  /** H1: sold listings closed within last `windowDays` with same seller + winner. */
+  async countSoldPairTradesInWindow(
+    sellerId: string,
+    buyerId: string,
+    windowDays: number
+  ): Promise<number> {
+    const res = await query<{ c: string }>(
+      `
+        SELECT COUNT(*)::text AS c
+        FROM auction_listings
+        WHERE status = 'sold'
+          AND seller_id = $1::uuid
+          AND current_high_bidder_id = $2::uuid
+          AND end_time >= NOW() - make_interval(days => $3::int)
+      `,
+      [sellerId, buyerId, windowDays]
+    );
+    return Number(res.rows[0]?.c ?? "0");
+  }
+
+  /** Distinct bidders with rows in auction_bid_history (open phase only). */
+  async countDistinctOpenBiddersForListing(auctionListingId: string): Promise<number> {
+    const res = await query<{ c: string }>(
+      `
+        SELECT COUNT(DISTINCT bidder_id)::text AS c
+        FROM auction_bid_history
+        WHERE auction_listing_id = $1::uuid
+      `,
+      [auctionListingId]
+    );
+    return Number(res.rows[0]?.c ?? "0");
+  }
+
+  async listBidIncrementRules(): Promise<
+    Array<{ minPrice: string; maxPrice: string | null; minIncrement: string }>
+  > {
+    const res = await query<{
+      min_price: string;
+      max_price: string | null;
+      min_increment: string;
+    }>(
+      `
+        SELECT
+          min_price::text AS min_price,
+          max_price::text AS max_price,
+          min_increment::text AS min_increment
+        FROM auction_bid_increment_rules
+        ORDER BY min_price ASC
+      `
+    );
+    return res.rows.map((r) => ({
+      minPrice: r.min_price,
+      maxPrice: r.max_price,
+      minIncrement: r.min_increment
+    }));
+  }
+
+  /**
+   * H6 metric: max count of rows for a single bidder where each count is bids in [anchor, anchor + window].
+   * Equivalent to max “bids per rolling window” for that listing.
+   */
+  async getMaxOpenBidsPerBidderInRollingWindow(
+    auctionListingId: string,
+    windowSeconds: number
+  ): Promise<number> {
+    const res = await query<{ max_cnt: string | null }>(
+      `
+        SELECT COALESCE(MAX(cnt), 0)::text AS max_cnt
+        FROM (
+          SELECT (
+            SELECT COUNT(*)::int
+            FROM auction_bid_history b2
+            WHERE b2.auction_listing_id = $1::uuid
+              AND b2.bidder_id = b1.bidder_id
+              AND b2.bid_at >= b1.bid_at
+              AND b2.bid_at <= b1.bid_at + ($2::bigint * interval '1 second')
+          ) AS cnt
+          FROM auction_bid_history b1
+          WHERE b1.auction_listing_id = $1::uuid
+        ) windows
+      `,
+      [auctionListingId, windowSeconds]
+    );
+    return Number(res.rows[0]?.max_cnt ?? "0");
+  }
+
+  /** Open-phase bid amounts in chronological order (for min-increment checks between consecutive standing highs). */
+  async listOpenBidHistoryAmountsAsc(auctionListingId: string): Promise<Array<{ bidAmountUsd: string }>> {
+    const res = await query<{ bid_amount: string }>(
+      `
+        SELECT bid_amount::text AS bid_amount
+        FROM auction_bid_history
+        WHERE auction_listing_id = $1::uuid
+        ORDER BY bid_at ASC, created_at ASC
+      `,
+      [auctionListingId]
+    );
+    return res.rows.map((r) => ({ bidAmountUsd: r.bid_amount }));
+  }
+
+  /**
+   * H3: among bidders who are not the sold listing’s winner (and not the seller), largest `auction_bid_history`
+   * row count for this listing. Zero if listing not sold or no qualifying bidder.
+   */
+  async getMaxOpenBidCountAmongSoldListingNonWinners(auctionListingId: string): Promise<number> {
+    const res = await query<{ max_cnt: string | null }>(
+      `
+        SELECT COALESCE(MAX(per_bidder.cnt), 0)::text AS max_cnt
+        FROM (
+          SELECT bh.bidder_id, COUNT(*)::int AS cnt
+          FROM auction_bid_history bh
+          WHERE bh.auction_listing_id = $1::uuid
+          GROUP BY bh.bidder_id
+        ) per_bidder
+        INNER JOIN auction_listings al ON al.id = $1::uuid
+        WHERE al.status = 'sold'
+          AND al.current_high_bidder_id IS NOT NULL
+          AND per_bidder.bidder_id <> al.current_high_bidder_id
+          AND per_bidder.bidder_id <> al.seller_id
+      `,
+      [auctionListingId]
+    );
+    return Number(res.rows[0]?.max_cnt ?? "0");
+  }
+
+  async setAuctionListingNeedsFraudReview(auctionListingId: string, needsReview: boolean): Promise<void> {
+    await query(`UPDATE auction_listings SET needs_fraud_review = $2 WHERE id = $1::uuid`, [
+      auctionListingId,
+      needsReview
+    ]);
   }
 }

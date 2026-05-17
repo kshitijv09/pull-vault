@@ -1,5 +1,14 @@
+import type { PoolClient } from "pg";
 import { getClient, query } from "../../db";
+import { PACK_INVENTORY_STATUS } from "../../shared/constants/packInventoryStatus.constants";
 import type { CatalogCard, GeneratedPack } from "./packGenerator.types";
+
+export interface PackTemplateRow {
+  id: string;
+  tierName: string;
+  priceText: string;
+  cardsPerPack: number;
+}
 
 interface CatalogCardRow {
   id: string;
@@ -38,6 +47,91 @@ export class PackGeneratorRepository {
       rarity: row.rarity,
       marketValueUsd: row.market_value_usd
     }));
+  }
+
+  /** Load `packs` rows for in-place card regeneration. */
+  async findPacksByIds(ids: string[]): Promise<PackTemplateRow[]> {
+    if (ids.length === 0) return [];
+    const result = await query<{
+      id: string;
+      tier_name: string;
+      price: string;
+      cards_per_pack: number;
+    }>(
+      `
+        SELECT id, tier_name, price::text AS price, cards_per_pack
+        FROM packs
+        WHERE id = ANY($1::uuid[])
+      `,
+      [ids]
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      tierName: row.tier_name,
+      priceText: row.price,
+      cardsPerPack: row.cards_per_pack
+    }));
+  }
+
+  /**
+   * `packs.id` templates that contain any of the given catalog `card.id` rows and are safe to regenerate:
+   * no `pack_inventory` row is `reserved`, and none is `in_drop_sale` on a **`live`** drop.
+   */
+  async findPackTemplateIdsEligibleForRegeneration(cardRowIds: string[]): Promise<string[]> {
+    if (cardRowIds.length === 0) return [];
+    const result = await query<{ pack_id: string }>(
+      `
+        SELECT DISTINCT pc.pack_id
+        FROM pack_card pc
+        WHERE pc.card_id = ANY($1::uuid[])
+          AND NOT EXISTS (
+            SELECT 1
+            FROM pack_inventory pi
+            INNER JOIN drops d ON d.id = pi.drop_id
+            WHERE pi.pack_id = pc.pack_id
+              AND pi.status = $2
+              AND LOWER(d.status) = 'live'
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM pack_inventory pi
+            WHERE pi.pack_id = pc.pack_id
+              AND pi.status = $3
+          )
+      `,
+      [cardRowIds, PACK_INVENTORY_STATUS.IN_DROP_SALE, PACK_INVENTORY_STATUS.RESERVED]
+    );
+    return result.rows.map((r) => r.pack_id);
+  }
+
+  /**
+   * Removes all `pack_card` rows for a template and inserts new links; updates `cards_per_pack`.
+   * Caller must run inside a transaction.
+   */
+  async replacePackCardLinks(
+    client: PoolClient,
+    packId: string,
+    catalogCardIds: string[],
+    cardsPerPack: number
+  ): Promise<void> {
+    await client.query(`DELETE FROM pack_card WHERE pack_id = $1::uuid`, [packId]);
+    for (const cardId of catalogCardIds) {
+      await client.query(
+        `
+          INSERT INTO pack_card (pack_id, card_id)
+          VALUES ($1::uuid, $2::uuid)
+        `,
+        [packId, cardId]
+      );
+    }
+    await client.query(
+      `
+        UPDATE packs
+        SET cards_per_pack = $2, updated_at = NOW()
+        WHERE id = $1::uuid
+      `,
+      [packId, cardsPerPack]
+    );
   }
 
   async insertGeneratedPackBatch(
